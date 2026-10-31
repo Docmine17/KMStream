@@ -1,0 +1,8 @@
+build/
+*.o
+*.d
+*.h264
+kmstreamd-live
+kmstream-pi-live
+kmstreamd
+kmstream-pi

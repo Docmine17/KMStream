@@ -1,5 +1,4 @@
-// kmstream_pi_live.c (v5) - Polling 100us (MattKC Fix) + Drain-to-Latest UDP (Zero Acumulo na Inicializacao/HDMI)
-#define _GNU_SOURCE
+/* kmstream_pi.c - KMStream Raspberry Pi 3B Client (UDP -> V4L2 M2M H.264 -> KMS/DRM) */
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -17,19 +16,14 @@
 #include <libavutil/hwcontext_drm.h>
 #include <libavutil/opt.h>
 
-#define UDP_PORT 5000
-#define CHUNK_SIZE 1400
-#define MAX_CHUNKS 384
-#define MAX_FRAME_SIZE (MAX_CHUNKS * CHUNK_SIZE)
+#include "protocol.h"
 
-struct __attribute__((packed)) UdpHeader {
-    uint32_t frame_id;
-    uint16_t chunk_idx;
-    uint16_t total_chunks;
-    uint16_t payload_len;
-    uint8_t  is_idr;
-    uint8_t  reserved;
-};
+#define DIE_IF(cond, fmt, ...) do { \
+    if (cond) { \
+        fprintf(stderr, "[kmstream-pi] FATAL (%s:%d): " fmt "\n", __FILE__, __LINE__, ##__VA_ARGS__); \
+        exit(1); \
+    } \
+} while (0)
 
 static inline uint64_t now_us(void) {
     struct timespec ts;
@@ -38,6 +32,7 @@ static inline uint64_t now_us(void) {
 }
 
 static enum AVPixelFormat get_drm_format(AVCodecContext *ctx, const enum AVPixelFormat *pix_fmts) {
+    (void)ctx;
     for (const enum AVPixelFormat *p = pix_fmts; *p != AV_PIX_FMT_NONE; p++) {
         if (*p == AV_PIX_FMT_DRM_PRIME) return *p;
     }
@@ -53,10 +48,12 @@ static int plane_supports_format(drmModePlane *p, uint32_t fmt) {
 
 int main(void) {
     int drm_fd = open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
-    if (drm_fd < 0) { perror("open /dev/dri/card0"); return 1; }
-    drmSetClientCap(drm_fd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1);
+    DIE_IF(drm_fd < 0, "open(/dev/dri/card0): %s", strerror(errno));
+    DIE_IF(drmSetClientCap(drm_fd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1) < 0,
+           "DRM_CLIENT_CAP_UNIVERSAL_PLANES failed");
 
     drmModeRes *res = drmModeGetResources(drm_fd);
+    DIE_IF(!res, "drmModeGetResources failed");
     uint32_t crtc_id = 0;
     int crtc_idx = -1, screen_w = 1920, screen_h = 1080;
 
@@ -83,34 +80,41 @@ int main(void) {
         if (res->crtcs[i] == crtc_id) { crtc_idx = i; break; }
     }
     drmModeFreeResources(res);
+    DIE_IF(!crtc_id || crtc_idx < 0, "no active HDMI/DRM connector found on /dev/dri/card0");
 
     const AVCodec *codec = avcodec_find_decoder_by_name("h264_v4l2m2m");
+    DIE_IF(!codec, "h264_v4l2m2m decoder not found");
     AVCodecContext *dec = avcodec_alloc_context3(codec);
+    DIE_IF(!dec, "avcodec_alloc_context3 failed");
     dec->get_format = get_drm_format;
     dec->flags |= AV_CODEC_FLAG_LOW_DELAY;
     dec->flags2 |= AV_CODEC_FLAG2_FAST;
     dec->extra_hw_frames = 1;
     av_opt_set_int(dec->priv_data, "num_output_buffers", 2, 0);
     av_opt_set_int(dec->priv_data, "num_capture_buffers", 3, 0);
-    avcodec_open2(dec, codec, NULL);
+    DIE_IF(avcodec_open2(dec, codec, NULL) < 0, "avcodec_open2(h264_v4l2m2m) failed");
 
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    DIE_IF(sock < 0, "socket: %s", strerror(errno));
     int rcvbuf = 256 * 1024;
     setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
 
     struct sockaddr_in addr = {
-        .sin_family = AF_INET, .sin_port = htons(UDP_PORT), .sin_addr.s_addr = INADDR_ANY
+        .sin_family = AF_INET, .sin_port = htons(KMS_VIDEO_PORT), .sin_addr.s_addr = INADDR_ANY
     };
-    if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) { perror("bind"); return 1; }
+    DIE_IF(bind(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0, "bind(port %d): %s",
+           KMS_VIDEO_PORT, strerror(errno));
 
-    printf("=== KMStream Pi 3B Client v5 (MattKC Zero-Hold + Drain-to-Latest) ===\n");
+    printf("=== KMStream Pi 3B Client (proto v%d, Zero-Hold + Drain-to-Latest) | Display: %dx%d ===\n",
+           KMS_PROTO_VERSION, screen_w, screen_h);
 
-    uint8_t *frame_buf = malloc(MAX_FRAME_SIZE);
-    uint8_t pkt_buf[1500];
+    uint8_t *frame_buf = malloc(KMS_MAX_FRAME);
+    uint8_t pkt_buf[sizeof(struct kms_video_hdr) + KMS_CHUNK_SIZE + 64];
     uint32_t cur_frame_id = 0, chunks_recv = 0, expected_chunks = 0, frame_len = 0, last_complete_len = 0;
 
     AVPacket *avpkt = av_packet_alloc();
     AVFrame *frame = av_frame_alloc();
+    DIE_IF(!frame_buf || !avpkt || !frame, "allocation failed");
     uint32_t video_plane_id = 0;
 
     uint32_t fb_ring[3] = {0, 0, 0};
@@ -125,23 +129,29 @@ int main(void) {
 
     while (1) {
         ssize_t n = recv(sock, pkt_buf, sizeof(pkt_buf), 0);
-        if (n <= (ssize_t)sizeof(struct UdpHeader)) continue;
+        if (n <= (ssize_t)sizeof(struct kms_video_hdr)) continue;
 
-        // Processa o pacote recebido e drena todos os pacotes que ja chegaram na placa de rede!
-        // Se um frame novo ja estiver completo no socket (ex: apos o 1o frame lento de init do /dev/video10),
-        // descarta os frames velhos sem acumular atraso!
+        /*
+         * Process the received packet and drain any packets already queued in the
+         * socket buffer. If a newer frame is already arriving, feed the previous
+         * complete frame to the decoder to keep P-frame references valid without
+         * accumulating display latency.
+         */
         int ready_to_decode = 0;
         while (1) {
-            struct UdpHeader *hdr = (struct UdpHeader *)pkt_buf;
-            uint8_t *payload = pkt_buf + sizeof(struct UdpHeader);
+            struct kms_video_hdr *hdr = (struct kms_video_hdr *)pkt_buf;
+            if (hdr->version != KMS_PROTO_VERSION) {
+                n = recv(sock, pkt_buf, sizeof(pkt_buf), MSG_DONTWAIT);
+                if (n <= (ssize_t)sizeof(struct kms_video_hdr)) break;
+                continue;
+            }
+            uint8_t *payload = pkt_buf + sizeof(struct kms_video_hdr);
 
             if (hdr->frame_id < cur_frame_id && (cur_frame_id - hdr->frame_id) < 1000) {
-                // Pacote atrasado de frame antigo, ignora
+                /* Stale packet from an older frame, ignore */
             } else {
                 if (hdr->frame_id > cur_frame_id) {
                     if (ready_to_decode) {
-                        // Ja tinhamos um frame completo, mas um frame MAIS NOVO ja chegou na fila!
-                        // Enviamos o anterior rapido para manter a referencia P-frame em dia
                         avpkt->data = frame_buf;
                         avpkt->size = frame_len;
                         avpkt->pts  = cur_frame_id;
@@ -155,10 +165,10 @@ int main(void) {
                     expected_chunks = hdr->total_chunks;
                 }
 
-                if (hdr->chunk_idx < MAX_CHUNKS && hdr->payload_len <= CHUNK_SIZE) {
-                    memcpy(frame_buf + (hdr->chunk_idx * CHUNK_SIZE), payload, hdr->payload_len);
+                if (hdr->chunk_idx < KMS_MAX_CHUNKS && hdr->payload_len <= KMS_CHUNK_SIZE) {
+                    memcpy(frame_buf + ((size_t)hdr->chunk_idx * KMS_CHUNK_SIZE), payload, hdr->payload_len);
                     if (hdr->chunk_idx == hdr->total_chunks - 1) {
-                        frame_len = (hdr->chunk_idx * CHUNK_SIZE) + hdr->payload_len;
+                        frame_len = (hdr->chunk_idx * KMS_CHUNK_SIZE) + hdr->payload_len;
                     }
                     chunks_recv++;
                 }
@@ -168,9 +178,8 @@ int main(void) {
                 }
             }
 
-            // Verifica sem bloquear (MSG_DONTWAIT) se ha mais pacotes esperando no buffer do kernel
             n = recv(sock, pkt_buf, sizeof(pkt_buf), MSG_DONTWAIT);
-            if (n <= (ssize_t)sizeof(struct UdpHeader)) break;
+            if (n <= (ssize_t)sizeof(struct kms_video_hdr)) break;
         }
 
         if (ready_to_decode) {
@@ -182,8 +191,10 @@ int main(void) {
             avcodec_send_packet(dec, avpkt);
             chunks_recv = 0;
 
-            // Com o SPS patcheado (max_dec_frame_buffering=1), o chip bcm2835-codec libera o proprio
-            // cur_frame_id em ~1.5ms (720p) a ~2.8ms (1080p)! Fazemos polling de 100us para pegar na hora!
+            /*
+             * With the patched SPS (max_dec_frame_buffering=1), bcm2835-codec
+             * releases cur_frame_id in ~1.5 ms (720p). Poll at 100 us intervals.
+             */
             AVFrame *latest_frame = NULL;
             uint64_t wait_deadline = t_dec0 + (first_frame_done ? 4500 : 50000);
 
@@ -224,7 +235,7 @@ int main(void) {
                         if (p) drmModeFreePlane(p);
                     }
                     drmModeFreePlaneResources(pres);
-                    printf("-> Stream %dx%d Conectado! Plane %u (%.4s)\n",
+                    printf("-> Stream %dx%d connected! Plane %u (%.4s)\n",
                            latest_frame->width, latest_frame->height, video_plane_id, (char *)&drm_fmt);
                 }
 
@@ -263,7 +274,7 @@ int main(void) {
                 frames_shown++;
                 uint64_t now = now_us();
                 if (now - fps_timer >= 2000000ULL) {
-                    printf("[Pi v5] %4.1f FPS | Size: %5u B | Decode Wait: %.2f ms | V4L2 Hold: %ld frames | Skipped Queue: %d\n",
+                    printf("[Pi] %4.1f FPS | Size: %5u B | Decode Wait: %.2f ms | V4L2 Hold: %ld frames | Skipped Queue: %d\n",
                            frames_shown * 1000000.0 / (now - fps_timer),
                            last_complete_len,
                            (frames_shown ? (sum_dec_us / (double)frames_shown) / 1000.0 : 0.0),

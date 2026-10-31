@@ -1,11 +1,12 @@
-// kmstreamd_live.c (v5) - Injetor Bitstream SPS/VUI (MattKC Fix: num_reorder_frames=0, max_dec_frame_buffering=1)
-#define _GNU_SOURCE
+/* kmstreamd.c - KMStream Server (KMS/DRM -> EGL/GLES -> VAAPI H.264 -> UDP) */
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <string.h>
+#include <errno.h>
+#include <getopt.h>
 #include <time.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -23,252 +24,24 @@
 #include <va/va_drm.h>
 #include <va/va_drmcommon.h>
 #include <libavcodec/avcodec.h>
-#include <libavcodec/bsf.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/hwcontext_vaapi.h>
 #include <libavutil/opt.h>
 
-#define UDP_PORT 5000
-#define CHUNK_SIZE 1400
+#include "protocol.h"
+#include "sps_patch.h"
 
-struct __attribute__((packed)) UdpHeader {
-    uint32_t frame_id;
-    uint16_t chunk_idx;
-    uint16_t total_chunks;
-    uint16_t payload_len;
-    uint8_t  is_idr;
-    uint8_t  reserved;
-};
+#define DIE_IF(cond, fmt, ...) do { \
+    if (cond) { \
+        fprintf(stderr, "[kmstreamd] FATAL (%s:%d): " fmt "\n", __FILE__, __LINE__, ##__VA_ARGS__); \
+        exit(1); \
+    } \
+} while (0)
 
 static inline uint64_t now_us(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
     return (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
-}
-
-// ============================================================================
-// REESCRITOR DE CABECALHO H.264 SPS (MATTKC / VANILLA WII U ZERO-LATENCY FIX)
-// Garante que todo NAL Unit SPS (Type 7) enviado ao Raspberry Pi 3B tenha:
-//   vui_parameters_present_flag = 1
-//   bitstream_restriction_flag  = 1
-//   num_reorder_frames          = 0
-//   max_dec_frame_buffering     = 1
-// Isso impede que o firmware VideoCore IV (/dev/video10) retenha 1-3 frames!
-// ============================================================================
-typedef struct {
-    const uint8_t *buf;
-    int size_bits;
-    int bit_pos;
-} BitReader;
-
-typedef struct {
-    uint8_t data[256];
-    int bit_pos;
-} BitWriter;
-
-static inline uint32_t br_get_bit(BitReader *r) {
-    if (r->bit_pos >= r->size_bits) return 0;
-    uint32_t b = (r->buf[r->bit_pos >> 3] >> (7 - (r->bit_pos & 7))) & 1;
-    r->bit_pos++;
-    return b;
-}
-
-static inline void bw_put_bit(BitWriter *w, uint32_t b) {
-    if ((w->bit_pos >> 3) >= (int)sizeof(w->data)) return;
-    if (b) w->data[w->bit_pos >> 3] |= (1 << (7 - (w->bit_pos & 7)));
-    else   w->data[w->bit_pos >> 3] &= ~(1 << (7 - (w->bit_pos & 7)));
-    w->bit_pos++;
-}
-
-static inline uint32_t br_copy_bits(BitReader *r, BitWriter *w, int n) {
-    uint32_t val = 0;
-    for (int i = 0; i < n; i++) {
-        uint32_t b = br_get_bit(r);
-        bw_put_bit(w, b);
-        val = (val << 1) | b;
-    }
-    return val;
-}
-
-static inline uint32_t br_copy_ue(BitReader *r, BitWriter *w) {
-    int zeros = 0;
-    while (r->bit_pos < r->size_bits && br_get_bit(r) == 0) {
-        bw_put_bit(w, 0);
-        zeros++;
-        if (zeros > 30) break;
-    }
-    bw_put_bit(w, 1);
-    uint32_t info = (zeros > 0) ? br_copy_bits(r, w, zeros) : 0;
-    return ((1U << zeros) - 1U) + info;
-}
-
-static inline void bw_write_ue(BitWriter *w, uint32_t val) {
-    uint32_t code = val + 1;
-    int len = 0;
-    for (uint32_t tmp = code; tmp > 0; tmp >>= 1) len++;
-    for (int i = 0; i < len - 1; i++) bw_put_bit(w, 0);
-    for (int i = len - 1; i >= 0; i--) bw_put_bit(w, (code >> i) & 1);
-}
-
-//Reescreve o RBSP do SPS truncando o VUI antigo e injetando VUI enxuto com max_dec_frame_buffering=1
-static int rewrite_sps_zero_latency(const uint8_t *nal_in, int nal_len, uint8_t *nal_out) {
-    uint8_t rbsp[256];
-    int rbsp_len = 0;
-    for (int i = 0; i < nal_len && rbsp_len < (int)sizeof(rbsp); i++) {
-        if (i >= 2 && nal_in[i] == 0x03 && nal_in[i - 1] == 0x00 && nal_in[i - 2] == 0x00) continue;
-        rbsp[rbsp_len++] = nal_in[i];
-    }
-
-    BitReader r = { .buf = rbsp, .size_bits = rbsp_len * 8, .bit_pos = 0 };
-    BitWriter w;
-    memset(&w, 0, sizeof(w));
-
-    uint32_t nal_hdr = br_copy_bits(&r, &w, 8);
-    if ((nal_hdr & 0x1F) != 7) return 0;
-
-    uint32_t profile_idc = br_copy_bits(&r, &w, 8);
-    br_copy_bits(&r, &w, 8); // constraint_set flags
-    br_copy_bits(&r, &w, 8); // level_idc
-    br_copy_ue(&r, &w);      // seq_parameter_set_id
-
-    if (profile_idc == 100 || profile_idc == 110 || profile_idc == 122 || profile_idc == 244 ||
-        profile_idc == 44  || profile_idc == 83  || profile_idc == 86  || profile_idc == 118 ||
-        profile_idc == 128 || profile_idc == 138 || profile_idc == 139 || profile_idc == 134) {
-        uint32_t chroma = br_copy_ue(&r, &w);
-        if (chroma == 3) br_copy_bits(&r, &w, 1);
-        br_copy_ue(&r, &w);
-        br_copy_ue(&r, &w);
-        br_copy_bits(&r, &w, 1);
-        if (br_copy_bits(&r, &w, 1)) {
-            int cnt = (chroma != 3) ? 8 : 12;
-            for (int i = 0; i < cnt; i++) {
-                if (br_copy_bits(&r, &w, 1)) {
-                    int sz = (i < 6) ? 16 : 64;
-                    int last = 8, next = 8;
-                    for (int j = 0; j < sz; j++) {
-                        if (next != 0) {
-                            uint32_t delta = br_copy_ue(&r, &w);
-                            int d = (delta & 1) ? (int)((delta + 1) >> 1) : -(int)(delta >> 1);
-                            next = (last + d + 256) % 256;
-                        }
-                        last = (next == 0) ? last : next;
-                    }
-                }
-            }
-        }
-    }
-
-    br_copy_ue(&r, &w); // log2_max_frame_num_minus4
-    uint32_t poc_type = br_copy_ue(&r, &w);
-    if (poc_type == 0) {
-        br_copy_ue(&r, &w);
-    } else if (poc_type == 1) {
-        br_copy_bits(&r, &w, 1);
-        br_copy_ue(&r, &w);
-        br_copy_ue(&r, &w);
-        uint32_t cycles = br_copy_ue(&r, &w);
-        for (uint32_t i = 0; i < cycles; i++) br_copy_ue(&r, &w);
-    }
-
-    // Forca max_num_ref_frames = 1 se vier maior
-    uint32_t num_ref = br_get_bit(&r); // Lê original apenas no leitor r
-    (void)num_ref;
-    // Retrocede 1 bit no leitor r para consumir o ue(v) original sem escrever no w
-    r.bit_pos--;
-    int z = 0;
-    while (r.bit_pos < r.size_bits && br_get_bit(&r) == 0) z++;
-    for (int i = 0; i < z; i++) br_get_bit(&r);
-    bw_write_ue(&w, 1); // max_num_ref_frames = 1
-
-    br_copy_bits(&r, &w, 1); // gaps_in_frame_num_value_allowed_flag
-    br_copy_ue(&r, &w);      // pic_width_in_mbs_minus1
-    br_copy_ue(&r, &w);      // pic_height_in_map_units_minus1
-    uint32_t frame_mbs_only = br_copy_bits(&r, &w, 1);
-    if (!frame_mbs_only) br_copy_bits(&r, &w, 1);
-    br_copy_bits(&r, &w, 1); // direct_8x8_inference_flag
-    if (br_copy_bits(&r, &w, 1)) { // frame_cropping_flag
-        br_copy_ue(&r, &w);
-        br_copy_ue(&r, &w);
-        br_copy_ue(&r, &w);
-        br_copy_ue(&r, &w);
-    }
-
-    // Ignora o resto do VUI original e escreve um VUI limpo com bitstream_restriction_flag = 1!
-    bw_put_bit(&w, 1); // vui_parameters_present_flag = 1
-    bw_put_bit(&w, 0); // aspect_ratio_info_present_flag = 0
-    bw_put_bit(&w, 0); // overscan_info_present_flag = 0
-    bw_put_bit(&w, 0); // video_signal_type_present_flag = 0
-    bw_put_bit(&w, 0); // chroma_loc_info_present_flag = 0
-    bw_put_bit(&w, 0); // timing_info_present_flag = 0
-    bw_put_bit(&w, 0); // nal_hrd_parameters_present_flag = 0
-    bw_put_bit(&w, 0); // vcl_hrd_parameters_present_flag = 0
-    bw_put_bit(&w, 0); // pic_struct_present_flag = 0
-    bw_put_bit(&w, 1); // bitstream_restriction_flag = 1
-    bw_put_bit(&w, 1); // motion_vectors_over_pic_boundaries_flag = 1
-    bw_write_ue(&w, 0);  // max_bytes_per_pic_denom = 0
-    bw_write_ue(&w, 0);  // max_bits_per_mb_denom = 0
-    bw_write_ue(&w, 10); // log2_max_mv_length_horizontal = 10
-    bw_write_ue(&w, 10); // log2_max_mv_length_vertical = 10
-    bw_write_ue(&w, 0);  // max_num_reorder_frames = 0 (ZERO REORDER!)
-    bw_write_ue(&w, 1);  // max_dec_frame_buffering = 1 (LIBERACAO IMEDIATA NO V4L2!)
-
-    // RBSP trailing bits (stop bit 1 + alinhamento a byte com 0)
-    bw_put_bit(&w, 1);
-    while ((w.bit_pos & 7) != 0) bw_put_bit(&w, 0);
-
-    int raw_bytes = w.bit_pos >> 3;
-    int out_len = 0;
-    int zero_cnt = 0;
-    for (int i = 0; i < raw_bytes; i++) {
-        if (zero_cnt == 2 && w.data[i] <= 0x03) {
-            nal_out[out_len++] = 0x03; // Emulation prevention byte
-            zero_cnt = 0;
-        }
-        nal_out[out_len++] = w.data[i];
-        if (w.data[i] == 0x00) zero_cnt++;
-        else zero_cnt = 0;
-    }
-    return out_len;
-}
-
-// Varre o pacote H.264 procurando NAL Type 7 (SPS) e substitui pelo SPS Zero-Latency
-static int patch_h264_packet_sps(const uint8_t *in_buf, int in_size, uint8_t *out_buf, int max_out, int *patched_flag) {
-    *patched_flag = 0;
-    int i = 0, out_pos = 0;
-    while (i < in_size - 4) {
-        int sc_len = 0;
-        if (in_buf[i] == 0 && in_buf[i+1] == 0 && in_buf[i+2] == 1) sc_len = 3;
-        else if (in_buf[i] == 0 && in_buf[i+1] == 0 && in_buf[i+2] == 0 && in_buf[i+3] == 1) sc_len = 4;
-
-        if (sc_len > 0) {
-            uint8_t nal_type = in_buf[i + sc_len] & 0x1F;
-            if (nal_type == 7) {
-                int nal_start = i + sc_len;
-                int nal_end = in_size;
-                for (int j = nal_start; j < in_size - 3; j++) {
-                    if (in_buf[j] == 0 && in_buf[j+1] == 0 && (in_buf[j+2] == 1 || (in_buf[j+2] == 0 && in_buf[j+3] == 1))) {
-                        nal_end = j;
-                        break;
-                    }
-                }
-                uint8_t new_sps[300];
-                int new_sps_len = rewrite_sps_zero_latency(in_buf + nal_start, nal_end - nal_start, new_sps);
-                if (new_sps_len > 0 && out_pos + sc_len + new_sps_len + (in_size - nal_end) < max_out) {
-                    memcpy(out_buf + out_pos, in_buf + i, sc_len);
-                    out_pos += sc_len;
-                    memcpy(out_buf + out_pos, new_sps, new_sps_len);
-                    out_pos += new_sps_len;
-                    memcpy(out_buf + out_pos, in_buf + nal_end, in_size - nal_end);
-                    out_pos += (in_size - nal_end);
-                    *patched_flag = 1;
-                    return out_pos;
-                }
-            }
-        }
-        out_buf[out_pos++] = in_buf[i++];
-    }
-    while (i < in_size && out_pos < max_out) out_buf[out_pos++] = in_buf[i++];
-    return out_pos;
 }
 
 static const char *vs_src =
@@ -303,11 +76,28 @@ static const char *fs_uv_src =
     "}\n";
 
 static GLuint compile_prog(const char *vs, const char *fs) {
-    GLuint v = glCreateShader(GL_VERTEX_SHADER); glShaderSource(v, 1, &vs, NULL); glCompileShader(v);
-    GLuint f = glCreateShader(GL_FRAGMENT_SHADER); glShaderSource(f, 1, &fs, NULL); glCompileShader(f);
-    GLuint p = glCreateProgram(); glAttachShader(p, v); glAttachShader(p, f);
-    glBindAttribLocation(p, 0, "pos"); glBindAttribLocation(p, 1, "in_uv");
-    glLinkProgram(p); return p;
+    GLint ok = 0;
+    GLuint v = glCreateShader(GL_VERTEX_SHADER);
+    glShaderSource(v, 1, &vs, NULL);
+    glCompileShader(v);
+    glGetShaderiv(v, GL_COMPILE_STATUS, &ok);
+    DIE_IF(!ok, "vertex shader compilation failed");
+
+    GLuint f = glCreateShader(GL_FRAGMENT_SHADER);
+    glShaderSource(f, 1, &fs, NULL);
+    glCompileShader(f);
+    glGetShaderiv(f, GL_COMPILE_STATUS, &ok);
+    DIE_IF(!ok, "fragment shader compilation failed");
+
+    GLuint p = glCreateProgram();
+    glAttachShader(p, v);
+    glAttachShader(p, f);
+    glBindAttribLocation(p, 0, "pos");
+    glBindAttribLocation(p, 1, "in_uv");
+    glLinkProgram(p);
+    glGetProgramiv(p, GL_LINK_STATUS, &ok);
+    DIE_IF(!ok, "shader program link failed");
+    return p;
 }
 
 static void get_plane_atomic_info(int drm_fd, uint32_t plane_id, uint64_t *type,
@@ -329,30 +119,66 @@ static void get_plane_atomic_info(int drm_fd, uint32_t plane_id, uint64_t *type,
     drmModeFreeObjectProperties(props);
 }
 
+static void usage(const char *prog) {
+    fprintf(stderr, "Usage: sudo %s [--dump <file.h264>] [--frames <N>] <PI_IP> [/dev/dri/card1] [1080|720]\n", prog);
+}
+
 int main(int argc, char **argv) {
-    if (argc < 2) {
-        printf("Uso: sudo %s <IP_DO_PI> [/dev/dri/card1] [1080|720]\n", argv[0]);
+    const char *dump_path = NULL;
+    uint32_t max_frames = 0;
+
+    static const struct option long_opts[] = {
+        { "dump",   required_argument, NULL, 'd' },
+        { "frames", required_argument, NULL, 'n' },
+        { "help",   no_argument,       NULL, 'h' },
+        { NULL, 0, NULL, 0 }
+    };
+
+    int opt;
+    while ((opt = getopt_long(argc, argv, "d:n:h", long_opts, NULL)) != -1) {
+        switch (opt) {
+        case 'd': dump_path = optarg; break;
+        case 'n': max_frames = (uint32_t)strtoul(optarg, NULL, 10); break;
+        case 'h':
+        default:
+            usage(argv[0]);
+            return (opt == 'h') ? 0 : 1;
+        }
+    }
+
+    if (argc - optind < 1) {
+        usage(argv[0]);
         return 1;
     }
-    const char *pi_ip = argv[1];
-    const char *card = (argc > 2) ? argv[2] : "/dev/dri/card1";
-    int use_720p = (argc > 3 && atoi(argv[3]) == 720) ? 1 : 0;
+
+    const char *pi_ip = argv[optind];
+    const char *card = (argc - optind > 1) ? argv[optind + 1] : "/dev/dri/card1";
+    int use_720p = (argc - optind > 2 && atoi(argv[optind + 2]) == 720) ? 1 : 0;
+
+    FILE *dump_fp = NULL;
+    if (dump_path) {
+        dump_fp = fopen(dump_path, "wb");
+        DIE_IF(!dump_fp, "failed to open dump file '%s': %s", dump_path, strerror(errno));
+    }
 
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    DIE_IF(sock < 0, "socket: %s", strerror(errno));
     int sndbuf = 512 * 1024;
     int tos = IPTOS_LOWDELAY;
     setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
     setsockopt(sock, IPPROTO_IP, IP_TOS, &tos, sizeof(tos));
-    struct sockaddr_in pi_addr = { .sin_family = AF_INET, .sin_port = htons(UDP_PORT) };
-    inet_pton(AF_INET, pi_ip, &pi_addr.sin_addr);
+    struct sockaddr_in pi_addr = { .sin_family = AF_INET, .sin_port = htons(KMS_VIDEO_PORT) };
+    DIE_IF(inet_pton(AF_INET, pi_ip, &pi_addr.sin_addr) != 1, "invalid target IP '%s'", pi_ip);
 
     int drm_fd = open(card, O_RDWR | O_CLOEXEC);
-    if (drm_fd < 0) { perror("open card"); return 1; }
-    drmSetClientCap(drm_fd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1);
-    drmSetClientCap(drm_fd, DRM_CLIENT_CAP_ATOMIC, 1);
+    DIE_IF(drm_fd < 0, "open(%s): %s (run as root or setcap cap_sys_admin+ep)", card, strerror(errno));
+    DIE_IF(drmSetClientCap(drm_fd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1) < 0, "DRM_CLIENT_CAP_UNIVERSAL_PLANES failed");
+    DIE_IF(drmSetClientCap(drm_fd, DRM_CLIENT_CAP_ATOMIC, 1) < 0, "DRM_CLIENT_CAP_ATOMIC failed");
 
     drmModeRes *res = drmModeGetResources(drm_fd);
+    DIE_IF(!res, "drmModeGetResources failed");
     drmModePlaneRes *plane_res = drmModeGetPlaneResources(drm_fd);
+    DIE_IF(!plane_res, "drmModeGetPlaneResources failed");
     uint32_t primary_plane_id = 0, cursor_plane_id = 0, active_crtc_id = 0, fb_id = 0;
     int active_crtc_idx = -1;
 
@@ -365,6 +191,8 @@ int main(int argc, char **argv) {
             fb_id = f;
         }
     }
+    DIE_IF(!primary_plane_id || !fb_id, "no active primary DRM plane found on %s", card);
+
     for (int i = 0; i < res->count_crtcs; i++) {
         if (res->crtcs[i] == active_crtc_id) { active_crtc_idx = i; break; }
     }
@@ -383,8 +211,10 @@ int main(int argc, char **argv) {
             if (p) drmModeFreePlane(p);
         }
     }
+    drmModeFreePlaneResources(plane_res);
 
     drmModeFB2 *fb0 = drmModeGetFB2(drm_fd, fb_id);
+    DIE_IF(!fb0, "drmModeGetFB2 failed (need CAP_SYS_ADMIN)");
     int src_w = fb0->width, src_h = fb0->height;
     drmModeFreeFB2(fb0);
 
@@ -392,19 +222,25 @@ int main(int argc, char **argv) {
     int enc_h = use_720p ? 720  : src_h;
 
     int render_fd = open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
+    DIE_IF(render_fd < 0, "open(/dev/dri/renderD128): %s", strerror(errno));
     struct gbm_device *gbm = gbm_create_device(render_fd);
+    DIE_IF(!gbm, "gbm_create_device failed");
     EGLDisplay egl_dpy = eglGetPlatformDisplay(EGL_PLATFORM_GBM_KHR, gbm, NULL);
-    eglInitialize(egl_dpy, NULL, NULL); eglBindAPI(EGL_OPENGL_ES_API);
-    EGLConfig cfg; EGLint num_cfg;
+    DIE_IF(egl_dpy == EGL_NO_DISPLAY, "eglGetPlatformDisplay failed");
+    DIE_IF(!eglInitialize(egl_dpy, NULL, NULL), "eglInitialize failed");
+    DIE_IF(!eglBindAPI(EGL_OPENGL_ES_API), "eglBindAPI failed");
+    EGLConfig cfg; EGLint num_cfg = 0;
     const EGLint cfg_attr[] = { EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT, EGL_NONE };
-    eglChooseConfig(egl_dpy, cfg_attr, &cfg, 1, &num_cfg);
+    DIE_IF(!eglChooseConfig(egl_dpy, cfg_attr, &cfg, 1, &num_cfg) || num_cfg < 1, "eglChooseConfig failed");
     const EGLint ctx_attr[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
     EGLContext egl_ctx = eglCreateContext(egl_dpy, cfg, EGL_NO_CONTEXT, ctx_attr);
-    eglMakeCurrent(egl_dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, egl_ctx);
+    DIE_IF(egl_ctx == EGL_NO_CONTEXT, "eglCreateContext failed");
+    DIE_IF(!eglMakeCurrent(egl_dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, egl_ctx), "eglMakeCurrent failed");
 
     PFNEGLCREATEIMAGEKHRPROC eglCreateImageKHR = (void *)eglGetProcAddress("eglCreateImageKHR");
     PFNEGLDESTROYIMAGEKHRPROC eglDestroyImageKHR = (void *)eglGetProcAddress("eglDestroyImageKHR");
     PFNGLEGLIMAGETARGETTEXTURE2DOESPROC glEGLImageTargetTexture2DOES = (void *)eglGetProcAddress("glEGLImageTargetTexture2DOES");
+    DIE_IF(!eglCreateImageKHR || !eglDestroyImageKHR || !glEGLImageTargetTexture2DOES, "missing EGL image extensions");
 
     GLuint prog_y = compile_prog(vs_src, fs_y_src);
     GLuint prog_uv = compile_prog(vs_src, fs_uv_src);
@@ -417,22 +253,26 @@ int main(int argc, char **argv) {
     glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void *)(2 * sizeof(float)));
 
     AVBufferRef *hw_device_ctx = NULL;
-    av_hwdevice_ctx_create(&hw_device_ctx, AV_HWDEVICE_TYPE_VAAPI, "/dev/dri/renderD128", NULL, 0);
+    DIE_IF(av_hwdevice_ctx_create(&hw_device_ctx, AV_HWDEVICE_TYPE_VAAPI, "/dev/dri/renderD128", NULL, 0) < 0,
+           "av_hwdevice_ctx_create(VAAPI) failed");
     VADisplay va_dpy = ((AVVAAPIDeviceContext *)((AVHWDeviceContext *)hw_device_ctx->data)->hwctx)->display;
 
     AVBufferRef *hw_frames_ref = av_hwframe_ctx_alloc(hw_device_ctx);
+    DIE_IF(!hw_frames_ref, "av_hwframe_ctx_alloc failed");
     AVHWFramesContext *frames_ctx = (AVHWFramesContext *)hw_frames_ref->data;
     frames_ctx->format = AV_PIX_FMT_VAAPI; frames_ctx->sw_format = AV_PIX_FMT_NV12;
     frames_ctx->width = enc_w; frames_ctx->height = enc_h; frames_ctx->initial_pool_size = 4;
-    av_hwframe_ctx_init(hw_frames_ref);
+    DIE_IF(av_hwframe_ctx_init(hw_frames_ref) < 0, "av_hwframe_ctx_init failed");
 
     AVFrame *va_frame = av_frame_alloc();
-    av_hwframe_get_buffer(hw_frames_ref, va_frame, 0);
+    DIE_IF(!va_frame, "av_frame_alloc failed");
+    DIE_IF(av_hwframe_get_buffer(hw_frames_ref, va_frame, 0) < 0, "av_hwframe_get_buffer failed");
     VASurfaceID nv12_surf = (VASurfaceID)(uintptr_t)va_frame->data[3];
 
     VADRMPRIMESurfaceDescriptor prime = {0};
-    vaExportSurfaceHandle(va_dpy, nv12_surf, VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
-                          VA_EXPORT_SURFACE_WRITE_ONLY | VA_EXPORT_SURFACE_SEPARATE_LAYERS, &prime);
+    VAStatus vast = vaExportSurfaceHandle(va_dpy, nv12_surf, VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
+                                          VA_EXPORT_SURFACE_WRITE_ONLY | VA_EXPORT_SURFACE_SEPARATE_LAYERS, &prime);
+    DIE_IF(vast != VA_STATUS_SUCCESS, "vaExportSurfaceHandle failed: %d", vast);
 
     EGLint y_attr[] = {
         EGL_WIDTH, enc_w, EGL_HEIGHT, enc_h, EGL_LINUX_DRM_FOURCC_EXT, DRM_FORMAT_R8,
@@ -448,20 +288,28 @@ int main(int argc, char **argv) {
     };
     EGLImageKHR img_y = eglCreateImageKHR(egl_dpy, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, NULL, y_attr);
     EGLImageKHR img_uv = eglCreateImageKHR(egl_dpy, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, NULL, uv_attr);
+    DIE_IF(img_y == EGL_NO_IMAGE_KHR || img_uv == EGL_NO_IMAGE_KHR, "eglCreateImageKHR for NV12 surface failed");
+    for (uint32_t i = 0; i < prime.num_objects; i++) {
+        if (prime.objects[i].fd >= 0) close(prime.objects[i].fd);
+    }
 
     GLuint tex_y, tex_uv, fbo_y, fbo_uv, tex_kms, tex_cur;
     glGenTextures(1, &tex_y); glBindTexture(GL_TEXTURE_2D, tex_y); glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, img_y);
     glGenFramebuffers(1, &fbo_y); glBindFramebuffer(GL_FRAMEBUFFER, fbo_y);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex_y, 0);
+    DIE_IF(glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE, "fbo_y incomplete");
 
     glGenTextures(1, &tex_uv); glBindTexture(GL_TEXTURE_2D, tex_uv); glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, img_uv);
     glGenFramebuffers(1, &fbo_uv); glBindFramebuffer(GL_FRAMEBUFFER, fbo_uv);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex_uv, 0);
+    DIE_IF(glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE, "fbo_uv incomplete");
 
     glGenTextures(1, &tex_kms); glGenTextures(1, &tex_cur);
 
     const AVCodec *codec = avcodec_find_encoder_by_name("h264_vaapi");
+    DIE_IF(!codec, "h264_vaapi encoder not found");
     AVCodecContext *enc = avcodec_alloc_context3(codec);
+    DIE_IF(!enc, "avcodec_alloc_context3 failed");
     enc->width = enc_w; enc->height = enc_h;
     enc->time_base = (AVRational){1, 60};
     enc->framerate = (AVRational){60, 1};
@@ -475,21 +323,23 @@ int main(int argc, char **argv) {
     av_opt_set(enc->priv_data, "rc_mode", "CQP", 0);
     av_opt_set(enc->priv_data, "profile", "constrained_baseline", 0);
     av_opt_set_int(enc->priv_data, "idr_interval", 1, 0);
-    avcodec_open2(enc, codec, NULL);
+    DIE_IF(avcodec_open2(enc, codec, NULL) < 0, "avcodec_open2(h264_vaapi) failed");
 
     AVPacket *pkt = av_packet_alloc();
-    uint8_t *patched_buf = malloc(512 * 1024);
+    uint8_t *patched_buf = malloc(KMS_MAX_FRAME);
+    DIE_IF(!pkt || !patched_buf, "allocation failed");
     float fullscreen_quad[] = { -1,-1,0,0,  1,-1,1,0,  -1,1,0,1,  1,1,1,1 };
 
-    printf("=== KMStream Server v5 (SPS Bitstream Patch Ativo!) (%dx%d -> %dx%d) | Primary: %u | Cursor: %u ===\n",
-           src_w, src_h, enc_w, enc_h, primary_plane_id, cursor_plane_id);
+    printf("=== KMStream Server (proto v%d, SPS Zero-Latency Patch) (%dx%d -> %dx%d) | Primary: %u | Cursor: %u ===\n",
+           KMS_PROTO_VERSION, src_w, src_h, enc_w, enc_h, primary_plane_id, cursor_plane_id);
 
     uint32_t frame_id = 1;
-    uint8_t udp_pkt[sizeof(struct UdpHeader) + CHUNK_SIZE];
+    uint32_t handle_fail_cnt = 0;
+    uint8_t udp_pkt[sizeof(struct kms_video_hdr) + KMS_CHUNK_SIZE];
     uint64_t next_frame_tick = now_us();
     int sps_logged = 0;
 
-    while (1) {
+    while (!max_frames || frame_id <= max_frames) {
         uint64_t now = now_us();
         if (now < next_frame_tick) usleep(next_frame_tick - now);
         next_frame_tick += 16666;
@@ -502,6 +352,9 @@ int main(int argc, char **argv) {
         }
         drmModeFB2 *fb = drmModeGetFB2(drm_fd, p->fb_id);
         if (!fb) { drmModeFreePlane(p); continue; }
+        DIE_IF(fb->handles[0] == 0 && ++handle_fail_cnt >= 3,
+               "drmModeGetFB2 returned handle=0 (CAP_SYS_ADMIN required: run with sudo or 'make caps')");
+        if (fb->handles[0] == 0) { drmModeFreeFB2(fb); drmModeFreePlane(p); continue; }
 
         int dmabuf_fd = -1;
         if (drmPrimeHandleToFD(drm_fd, fb->handles[0], DRM_CLOEXEC | DRM_RDWR, &dmabuf_fd) < 0) {
@@ -516,6 +369,9 @@ int main(int argc, char **argv) {
             EGL_DMA_BUF_PLANE0_PITCH_EXT, (EGLint)fb->pitches[0], EGL_NONE
         };
         EGLImageKHR img_kms = eglCreateImageKHR(egl_dpy, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, NULL, kms_attr);
+        if (img_kms == EGL_NO_IMAGE_KHR) {
+            close(dmabuf_fd); drmModeFreeFB2(fb); drmModeFreePlane(p); continue;
+        }
 
         EGLImageKHR img_cur = EGL_NO_IMAGE_KHR;
         int cur_fd = -1;
@@ -546,7 +402,7 @@ int main(int argc, char **argv) {
             }
         }
 
-        // Renderiza Plano Y
+        /* Render Y plane */
         glBindFramebuffer(GL_FRAMEBUFFER, fbo_y);
         glViewport(0, 0, enc_w, enc_h);
         glUseProgram(prog_y);
@@ -568,7 +424,7 @@ int main(int argc, char **argv) {
             glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
         }
 
-        // Renderiza Plano UV
+        /* Render UV plane */
         glBindFramebuffer(GL_FRAMEBUFFER, fbo_uv);
         glViewport(0, 0, enc_w / 2, enc_h / 2);
         glUseProgram(prog_uv);
@@ -590,33 +446,43 @@ int main(int argc, char **argv) {
         while (avcodec_receive_packet(enc, pkt) == 0) {
             const uint8_t *send_ptr = pkt->data;
             int send_size = pkt->size;
+            uint8_t flags = 0;
 
-            // Se for Keyframe (contem SPS), reescreve o VUI do SPS com max_dec_frame_buffering=1!
             if (pkt->flags & AV_PKT_FLAG_KEY) {
+                flags |= KMS_FLAG_IDR;
                 int patched = 0;
-                int new_sz = patch_h264_packet_sps(pkt->data, pkt->size, patched_buf, 512 * 1024, &patched);
+                int new_sz = sps_patch_packet(pkt->data, pkt->size, patched_buf, KMS_MAX_FRAME, &patched);
                 if (patched) {
                     send_ptr = patched_buf;
                     send_size = new_sz;
+                    flags |= KMS_FLAG_SPS_PATCHED;
                     if (!sps_logged) {
-                        printf("-> [MattKC SPS Patch] VUI reescrito com sucesso! (num_reorder_frames=0, max_dec_frame_buffering=1)\n");
+                        printf("-> [SPS Patch] VUI rewritten (num_reorder_frames=0, max_dec_frame_buffering=1)\n");
                         sps_logged = 1;
                     }
                 }
             }
 
-            uint16_t total_chunks = (send_size + CHUNK_SIZE - 1) / CHUNK_SIZE;
+            if (dump_fp) {
+                fwrite(send_ptr, 1, (size_t)send_size, dump_fp);
+                fflush(dump_fp);
+            }
+
+            uint16_t total_chunks = (uint16_t)((send_size + KMS_CHUNK_SIZE - 1) / KMS_CHUNK_SIZE);
             for (uint16_t c = 0; c < total_chunks; c++) {
-                int offset = c * CHUNK_SIZE;
-                uint16_t len = (send_size - offset > CHUNK_SIZE) ? CHUNK_SIZE : (send_size - offset);
-                struct UdpHeader *hdr = (struct UdpHeader *)udp_pkt;
-                hdr->frame_id = frame_id;
-                hdr->chunk_idx = c;
+                int offset = c * KMS_CHUNK_SIZE;
+                uint16_t len = (send_size - offset > KMS_CHUNK_SIZE) ? KMS_CHUNK_SIZE : (uint16_t)(send_size - offset);
+                struct kms_video_hdr *hdr = (struct kms_video_hdr *)udp_pkt;
+                memset(hdr, 0, sizeof(*hdr));
+                hdr->version      = KMS_PROTO_VERSION;
+                hdr->flags        = flags;
+                hdr->chunk_idx    = c;
                 hdr->total_chunks = total_chunks;
-                hdr->payload_len = len;
-                hdr->is_idr = (pkt->flags & AV_PKT_FLAG_KEY) ? 1 : 0;
-                memcpy(udp_pkt + sizeof(struct UdpHeader), send_ptr + offset, len);
-                sendto(sock, udp_pkt, sizeof(struct UdpHeader) + len, 0,
+                hdr->payload_len  = len;
+                hdr->frame_id     = frame_id;
+                hdr->frame_size   = (uint32_t)send_size;
+                memcpy(udp_pkt + sizeof(struct kms_video_hdr), send_ptr + offset, len);
+                sendto(sock, udp_pkt, sizeof(struct kms_video_hdr) + len, 0,
                        (struct sockaddr *)&pi_addr, sizeof(pi_addr));
             }
             frame_id++;
@@ -632,5 +498,7 @@ int main(int argc, char **argv) {
         drmModeFreeFB2(fb);
         drmModeFreePlane(p);
     }
+
+    if (dump_fp) fclose(dump_fp);
     return 0;
 }
