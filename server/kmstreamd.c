@@ -7,6 +7,7 @@
 #include <string.h>
 #include <errno.h>
 #include <getopt.h>
+#include <poll.h>
 #include <time.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -29,6 +30,7 @@
 #include <libavutil/opt.h>
 
 #include "protocol.h"
+#include "stats.h"
 #include "sps_patch.h"
 
 #define DIE_IF(cond, fmt, ...) do { \
@@ -42,6 +44,10 @@ static inline uint64_t now_us(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
     return (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
+}
+
+static inline uint16_t clamp_u16(uint64_t v) {
+    return (v > 65535ULL) ? 65535U : (uint16_t)v;
 }
 
 static const char *vs_src =
@@ -119,6 +125,61 @@ static void get_plane_atomic_info(int drm_fd, uint32_t plane_id, uint64_t *type,
     drmModeFreeObjectProperties(props);
 }
 
+/* Drains incoming back-channel messages (PING -> PONG immediately, STATS -> cached). */
+static void drain_ctrl_sock(int ctrl_sock, struct kms_ctrl_stats *last_pi_stats, int *has_pi_stats) {
+    uint8_t buf[128];
+    struct sockaddr_in peer;
+    socklen_t peer_len = sizeof(peer);
+
+    while (1) {
+        peer_len = sizeof(peer);
+        ssize_t n = recvfrom(ctrl_sock, buf, sizeof(buf), MSG_DONTWAIT,
+                             (struct sockaddr *)&peer, &peer_len);
+        if (n < (ssize_t)sizeof(struct kms_ctrl_hdr)) break;
+
+        uint64_t t1 = now_us();
+        const struct kms_ctrl_hdr *h = (const struct kms_ctrl_hdr *)buf;
+        if (h->version != KMS_PROTO_VERSION) continue;
+
+        if (h->type == KMS_CTRL_PING && n >= (ssize_t)sizeof(struct kms_ctrl_ping)) {
+            const struct kms_ctrl_ping *ping = (const struct kms_ctrl_ping *)buf;
+            struct kms_ctrl_pong pong = {
+                .h = {
+                    .version  = KMS_PROTO_VERSION,
+                    .type     = KMS_CTRL_PONG,
+                    .reserved = 0,
+                    .seq      = ping->h.seq,
+                },
+                .t0_us = ping->t0_us,
+                .t1_us = t1,
+                .t2_us = now_us(),
+            };
+            sendto(ctrl_sock, &pong, sizeof(pong), MSG_DONTWAIT,
+                   (const struct sockaddr *)&peer, peer_len);
+        } else if (h->type == KMS_CTRL_STATS && n >= (ssize_t)sizeof(struct kms_ctrl_stats)) {
+            memcpy(last_pi_stats, buf, sizeof(*last_pi_stats));
+            *has_pi_stats = 1;
+        }
+    }
+}
+
+/* Sleeps until deadline_us while waking immediately on any incoming control packet (PING). */
+static void wait_until_or_ctrl(int ctrl_sock, uint64_t deadline_us,
+                               struct kms_ctrl_stats *last_pi_stats, int *has_pi_stats) {
+    while (1) {
+        drain_ctrl_sock(ctrl_sock, last_pi_stats, has_pi_stats);
+        uint64_t now = now_us();
+        if (now >= deadline_us) break;
+        uint64_t rem_us = deadline_us - now;
+        struct timespec ts = {
+            .tv_sec  = (time_t)(rem_us / 1000000ULL),
+            .tv_nsec = (long)((rem_us % 1000000ULL) * 1000ULL),
+        };
+        struct pollfd pfd = { .fd = ctrl_sock, .events = POLLIN };
+        ppoll(&pfd, 1, &ts, NULL);
+    }
+}
+
 static void usage(const char *prog) {
     fprintf(stderr, "Usage: sudo %s [--dump <file.h264>] [--frames <N>] <PI_IP> [/dev/dri/card1] [1080|720]\n", prog);
 }
@@ -169,6 +230,15 @@ int main(int argc, char **argv) {
     setsockopt(sock, IPPROTO_IP, IP_TOS, &tos, sizeof(tos));
     struct sockaddr_in pi_addr = { .sin_family = AF_INET, .sin_port = htons(KMS_VIDEO_PORT) };
     DIE_IF(inet_pton(AF_INET, pi_ip, &pi_addr.sin_addr) != 1, "invalid target IP '%s'", pi_ip);
+
+    int ctrl_sock = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    DIE_IF(ctrl_sock < 0, "ctrl socket: %s", strerror(errno));
+    setsockopt(ctrl_sock, IPPROTO_IP, IP_TOS, &tos, sizeof(tos));
+    struct sockaddr_in ctrl_addr = {
+        .sin_family = AF_INET, .sin_port = htons(KMS_CTRL_PORT), .sin_addr.s_addr = INADDR_ANY
+    };
+    DIE_IF(bind(ctrl_sock, (struct sockaddr *)&ctrl_addr, sizeof(ctrl_addr)) < 0,
+           "bind ctrl port %d: %s", KMS_CTRL_PORT, strerror(errno));
 
     int drm_fd = open(card, O_RDWR | O_CLOEXEC);
     DIE_IF(drm_fd < 0, "open(%s): %s (run as root or setcap cap_sys_admin+ep)", card, strerror(errno));
@@ -332,18 +402,27 @@ int main(int argc, char **argv) {
 
     printf("=== KMStream Server (proto v%d, SPS Zero-Latency Patch) (%dx%d -> %dx%d) | Primary: %u | Cursor: %u ===\n",
            KMS_PROTO_VERSION, src_w, src_h, enc_w, enc_h, primary_plane_id, cursor_plane_id);
+    fflush(stdout);
 
     uint32_t frame_id = 1;
     uint32_t handle_fail_cnt = 0;
     uint8_t udp_pkt[sizeof(struct kms_video_hdr) + KMS_CHUNK_SIZE];
     uint64_t next_frame_tick = now_us();
+    uint64_t stat_timer = next_frame_tick;
     int sps_logged = 0;
 
+    struct kms_stat_win st_conv = {0}, st_enc = {0}, st_tx = {0}, st_sz = {0};
+    uint32_t tx_errors = 0;
+    struct kms_ctrl_stats last_pi_stats = {0};
+    int has_pi_stats = 0;
+
     while (!max_frames || frame_id <= max_frames) {
+        wait_until_or_ctrl(ctrl_sock, next_frame_tick, &last_pi_stats, &has_pi_stats);
         uint64_t now = now_us();
-        if (now < next_frame_tick) usleep(next_frame_tick - now);
         next_frame_tick += 16666;
         if (now > next_frame_tick + 30000) next_frame_tick = now;
+
+        uint64_t t_cap0 = now;
 
         drmModePlane *p = drmModeGetPlane(drm_fd, primary_plane_id);
         if (!p || p->fb_id == 0) {
@@ -440,6 +519,8 @@ int main(int argc, char **argv) {
             glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
         }
         glFinish();
+        uint64_t t_conv_end = now_us();
+        uint64_t conv_us = t_conv_end - t_cap0;
 
         va_frame->pts = frame_id;
         avcodec_send_frame(enc, va_frame);
@@ -458,10 +539,14 @@ int main(int argc, char **argv) {
                     flags |= KMS_FLAG_SPS_PATCHED;
                     if (!sps_logged) {
                         printf("-> [SPS Patch] VUI rewritten (num_reorder_frames=0, max_dec_frame_buffering=1)\n");
+                        fflush(stdout);
                         sps_logged = 1;
                     }
                 }
             }
+
+            uint64_t t_enc_end = now_us();
+            uint64_t enc_us = t_enc_end - t_conv_end;
 
             if (dump_fp) {
                 fwrite(send_ptr, 1, (size_t)send_size, dump_fp);
@@ -474,19 +559,70 @@ int main(int argc, char **argv) {
                 uint16_t len = (send_size - offset > KMS_CHUNK_SIZE) ? KMS_CHUNK_SIZE : (uint16_t)(send_size - offset);
                 struct kms_video_hdr *hdr = (struct kms_video_hdr *)udp_pkt;
                 memset(hdr, 0, sizeof(*hdr));
-                hdr->version      = KMS_PROTO_VERSION;
-                hdr->flags        = flags;
-                hdr->chunk_idx    = c;
-                hdr->total_chunks = total_chunks;
-                hdr->payload_len  = len;
-                hdr->frame_id     = frame_id;
-                hdr->frame_size   = (uint32_t)send_size;
+                hdr->version       = KMS_PROTO_VERSION;
+                hdr->flags         = flags;
+                hdr->chunk_idx     = c;
+                hdr->total_chunks  = total_chunks;
+                hdr->payload_len   = len;
+                hdr->frame_id      = frame_id;
+                hdr->frame_size    = (uint32_t)send_size;
+                hdr->capture_ts_us = t_cap0;
+                hdr->t_convert_us  = clamp_u16(conv_us);
+                hdr->t_encode_us   = clamp_u16(enc_us);
                 memcpy(udp_pkt + sizeof(struct kms_video_hdr), send_ptr + offset, len);
-                sendto(sock, udp_pkt, sizeof(struct kms_video_hdr) + len, 0,
-                       (struct sockaddr *)&pi_addr, sizeof(pi_addr));
+                if (sendto(sock, udp_pkt, sizeof(struct kms_video_hdr) + len, 0,
+                           (struct sockaddr *)&pi_addr, sizeof(pi_addr)) < 0) {
+                    tx_errors++;
+                }
             }
+            uint64_t t_tx_end = now_us();
+            uint64_t tx_us = t_tx_end - t_enc_end;
+
+            kms_stat_add(&st_conv, (uint32_t)conv_us);
+            kms_stat_add(&st_enc,  (uint32_t)enc_us);
+            kms_stat_add(&st_tx,   (uint32_t)tx_us);
+            kms_stat_add(&st_sz,   (uint32_t)send_size);
+
             frame_id++;
             av_packet_unref(pkt);
+        }
+
+        drain_ctrl_sock(ctrl_sock, &last_pi_stats, &has_pi_stats);
+
+        uint64_t t_log = now_us();
+        if (t_log - stat_timer >= 2000000ULL && st_conv.count > 0) {
+            uint32_t conv_avg, conv_p99, enc_avg, enc_p99, tx_avg, tx_p99, sz_avg, sz_p99;
+            double fps = st_conv.count * 1000000.0 / (double)(t_log - stat_timer);
+            kms_stat_compute(&st_conv, &conv_avg, &conv_p99);
+            kms_stat_compute(&st_enc,  &enc_avg,  &enc_p99);
+            kms_stat_compute(&st_tx,   &tx_avg,   &tx_p99);
+            kms_stat_compute(&st_sz,   &sz_avg,   &sz_p99);
+
+            if (has_pi_stats) {
+                printf("[PC] %4.1f FPS | Size: %4.1f/%4.1f KB | Conv: %.2f/%.2f ms | Enc: %.2f/%.2f ms | TX: %.2f/%.2f ms (err:%u) | Pi E2E: %.2f/%.2f ms (inc:%u)\n",
+                       fps,
+                       sz_avg / 1024.0, sz_p99 / 1024.0,
+                       conv_avg / 1000.0, conv_p99 / 1000.0,
+                       enc_avg / 1000.0, enc_p99 / 1000.0,
+                       tx_avg / 1000.0, tx_p99 / 1000.0,
+                       tx_errors,
+                       last_pi_stats.e2e_us_avg / 1000.0, last_pi_stats.e2e_us_p99 / 1000.0,
+                       last_pi_stats.frames_lost);
+            } else {
+                printf("[PC] %4.1f FPS | Size: %4.1f/%4.1f KB | Conv: %.2f/%.2f ms | Enc: %.2f/%.2f ms | TX: %.2f/%.2f ms (err:%u)\n",
+                       fps,
+                       sz_avg / 1024.0, sz_p99 / 1024.0,
+                       conv_avg / 1000.0, conv_p99 / 1000.0,
+                       enc_avg / 1000.0, enc_p99 / 1000.0,
+                       tx_avg / 1000.0, tx_p99 / 1000.0,
+                       tx_errors);
+            }
+            fflush(stdout);
+            kms_stat_reset(&st_conv);
+            kms_stat_reset(&st_enc);
+            kms_stat_reset(&st_tx);
+            kms_stat_reset(&st_sz);
+            stat_timer = t_log;
         }
 
         if (img_cur != EGL_NO_IMAGE_KHR) eglDestroyImageKHR(egl_dpy, img_cur);

@@ -25,12 +25,12 @@ Workflow per phase: plan → subagent review → approval → implement → test
 - [x] Validate: 720p behaves exactly as before
 
 ## Phase 1 — Latency instrumentation (720p baseline)
-- [ ] Fill timestamps/timings in the video header
-- [ ] Clock offset estimation PC↔Pi (ping/pong over back-channel)
-- [ ] Per-stage stats: capture, convert, encode, send, network, reassembly, decode, display
-- [ ] Periodic stats log (avg / p99) on both sides + loss/drop counters
-- [ ] Optional: camera/photodiode glass-to-glass procedure in `docs/`
-- [ ] Baseline numbers recorded for 720p (1080p after Phase 2)
+- [x] Fill timestamps/timings in the video header
+- [x] Clock offset estimation PC↔Pi (ping/pong over back-channel)
+- [x] Per-stage stats: capture, convert, encode, send, network, reassembly, decode, display
+- [x] Periodic stats log (avg / p99) on both sides + loss/drop counters
+- [x] Optional: camera/photodiode glass-to-glass procedure in `docs/`
+- [x] Baseline numbers recorded for 720p (1080p after Phase 2)
 
 ## Phase 2 — Network & pipeline robustness (expected to fix 1080p)
 - [ ] Client: dedicated high-priority RX thread + preallocated frame ring (decoupled from decode/display)

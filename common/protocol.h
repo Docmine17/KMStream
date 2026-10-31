@@ -83,11 +83,13 @@ struct __attribute__((packed)) kms_ctrl_stats {
     uint32_t frames_ok;
     uint32_t frames_lost;
     uint32_t rx_drops;
+    uint32_t e2e_us_avg;
+    uint32_t e2e_us_p99;
     uint16_t decode_us_avg;
     uint16_t decode_us_p99;
     uint16_t display_us_avg;
     uint16_t display_us_p99;
 };
-_Static_assert(sizeof(struct kms_ctrl_stats) == 28, "kms_ctrl_stats size mismatch");
+_Static_assert(sizeof(struct kms_ctrl_stats) == 36, "kms_ctrl_stats size mismatch");
 
 #endif /* KMSTREAM_PROTOCOL_H */
