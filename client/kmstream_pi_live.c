@@ -1,4 +1,4 @@
-// kmstream_pi_live.c (v4) - Sincronia Imediata V4L2 (Zero Frame Hold) + Drenagem de Rede
+// kmstream_pi_live.c (v5) - Polling 100us (MattKC Fix) + Drain-to-Latest UDP (Zero Acumulo na Inicializacao/HDMI)
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
@@ -91,7 +91,7 @@ int main(void) {
     dec->flags2 |= AV_CODEC_FLAG2_FAST;
     dec->extra_hw_frames = 1;
     av_opt_set_int(dec->priv_data, "num_output_buffers", 2, 0);
-    av_opt_set_int(dec->priv_data, "num_capture_buffers", 4, 0);
+    av_opt_set_int(dec->priv_data, "num_capture_buffers", 3, 0);
     avcodec_open2(dec, codec, NULL);
 
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
@@ -103,7 +103,7 @@ int main(void) {
     };
     if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) { perror("bind"); return 1; }
 
-    printf("=== KMStream Pi 3B Client v4 (Wait-For-Current-Frame = Zero Hold) ===\n");
+    printf("=== KMStream Pi 3B Client v5 (MattKC Zero-Hold + Drain-to-Latest) ===\n");
 
     uint8_t *frame_buf = malloc(MAX_FRAME_SIZE);
     uint8_t pkt_buf[1500];
@@ -119,48 +119,73 @@ int main(void) {
 
     uint64_t fps_timer = now_us();
     uint64_t sum_dec_us = 0;
-    int frames_shown = 0, dropped_frames = 0;
+    int frames_shown = 0, skipped_stale = 0;
     int64_t last_v4l2_hold = 0;
+    int first_frame_done = 0;
 
     while (1) {
         ssize_t n = recv(sock, pkt_buf, sizeof(pkt_buf), 0);
         if (n <= (ssize_t)sizeof(struct UdpHeader)) continue;
 
-        struct UdpHeader *hdr = (struct UdpHeader *)pkt_buf;
-        uint8_t *payload = pkt_buf + sizeof(struct UdpHeader);
+        // Processa o pacote recebido e drena todos os pacotes que ja chegaram na placa de rede!
+        // Se um frame novo ja estiver completo no socket (ex: apos o 1o frame lento de init do /dev/video10),
+        // descarta os frames velhos sem acumular atraso!
+        int ready_to_decode = 0;
+        while (1) {
+            struct UdpHeader *hdr = (struct UdpHeader *)pkt_buf;
+            uint8_t *payload = pkt_buf + sizeof(struct UdpHeader);
 
-        if (hdr->frame_id < cur_frame_id && (cur_frame_id - hdr->frame_id) < 1000) continue;
+            if (hdr->frame_id < cur_frame_id && (cur_frame_id - hdr->frame_id) < 1000) {
+                // Pacote atrasado de frame antigo, ignora
+            } else {
+                if (hdr->frame_id > cur_frame_id) {
+                    if (ready_to_decode) {
+                        // Ja tinhamos um frame completo, mas um frame MAIS NOVO ja chegou na fila!
+                        // Enviamos o anterior rapido para manter a referencia P-frame em dia
+                        avpkt->data = frame_buf;
+                        avpkt->size = frame_len;
+                        avpkt->pts  = cur_frame_id;
+                        avcodec_send_packet(dec, avpkt);
+                        ready_to_decode = 0;
+                        skipped_stale++;
+                    }
+                    cur_frame_id = hdr->frame_id;
+                    chunks_recv = 0;
+                    frame_len = 0;
+                    expected_chunks = hdr->total_chunks;
+                }
 
-        if (hdr->frame_id > cur_frame_id) {
-            if (chunks_recv > 0 && chunks_recv != expected_chunks) dropped_frames++;
-            cur_frame_id = hdr->frame_id;
-            chunks_recv = 0;
-            frame_len = 0;
-            expected_chunks = hdr->total_chunks;
-        }
+                if (hdr->chunk_idx < MAX_CHUNKS && hdr->payload_len <= CHUNK_SIZE) {
+                    memcpy(frame_buf + (hdr->chunk_idx * CHUNK_SIZE), payload, hdr->payload_len);
+                    if (hdr->chunk_idx == hdr->total_chunks - 1) {
+                        frame_len = (hdr->chunk_idx * CHUNK_SIZE) + hdr->payload_len;
+                    }
+                    chunks_recv++;
+                }
 
-        if (hdr->chunk_idx < MAX_CHUNKS && hdr->payload_len <= CHUNK_SIZE) {
-            memcpy(frame_buf + (hdr->chunk_idx * CHUNK_SIZE), payload, hdr->payload_len);
-            if (hdr->chunk_idx == hdr->total_chunks - 1) {
-                frame_len = (hdr->chunk_idx * CHUNK_SIZE) + hdr->payload_len;
+                if (chunks_recv == expected_chunks && expected_chunks > 0 && frame_len > 0) {
+                    ready_to_decode = 1;
+                }
             }
-            chunks_recv++;
+
+            // Verifica sem bloquear (MSG_DONTWAIT) se ha mais pacotes esperando no buffer do kernel
+            n = recv(sock, pkt_buf, sizeof(pkt_buf), MSG_DONTWAIT);
+            if (n <= (ssize_t)sizeof(struct UdpHeader)) break;
         }
 
-        if (chunks_recv == expected_chunks && expected_chunks > 0 && frame_len > 0) {
+        if (ready_to_decode) {
             uint64_t t_dec0 = now_us();
             last_complete_len = frame_len;
             avpkt->data = frame_buf;
             avpkt->size = frame_len;
             avpkt->pts  = cur_frame_id;
             avcodec_send_packet(dec, avpkt);
+            chunks_recv = 0;
 
-            // O PULO DO GATO CONTRA O V4L2 HOLD:
-            // Em vez de sair na hora (em 0.16ms) pegando um frame velho e deixando o frame atual
-            // mofando no driver ate o proximo pacote de rede chegar, esperamos ate ~6ms (em passos de 200us)
-            // para que o chip bcm2835-codec termine de decodificar ESTE frame e o solte na hora!
+            // Com o SPS patcheado (max_dec_frame_buffering=1), o chip bcm2835-codec libera o proprio
+            // cur_frame_id em ~1.5ms (720p) a ~2.8ms (1080p)! Fazemos polling de 100us para pegar na hora!
             AVFrame *latest_frame = NULL;
-            uint64_t wait_deadline = t_dec0 + 6500; // Max 6.5ms de espera ativa pelo chip
+            uint64_t wait_deadline = t_dec0 + (first_frame_done ? 4500 : 50000);
 
             while (now_us() < wait_deadline) {
                 while (avcodec_receive_frame(dec, frame) == 0) {
@@ -172,14 +197,15 @@ int main(void) {
                         av_frame_unref(frame);
                     }
                 }
-                // Se o chip ja entregou o frame atual (Hold == 0), sai do loop imediatamente!
                 if (latest_frame && latest_frame->pts == (int64_t)cur_frame_id) break;
-                usleep(200);
+                usleep(100);
             }
 
-            sum_dec_us += (now_us() - t_dec0);
+            uint64_t dec_elapsed = now_us() - t_dec0;
+            sum_dec_us += dec_elapsed;
 
             if (latest_frame) {
+                first_frame_done = 1;
                 if (latest_frame->pts > 0) {
                     last_v4l2_hold = (int64_t)cur_frame_id - latest_frame->pts;
                 }
@@ -237,12 +263,12 @@ int main(void) {
                 frames_shown++;
                 uint64_t now = now_us();
                 if (now - fps_timer >= 2000000ULL) {
-                    printf("[Pi v4] %4.1f FPS | Size: %5u B | Decode Wait: %.2f ms | V4L2 Hold: %ld frames | Drops: %d\n",
+                    printf("[Pi v5] %4.1f FPS | Size: %5u B | Decode Wait: %.2f ms | V4L2 Hold: %ld frames | Skipped Queue: %d\n",
                            frames_shown * 1000000.0 / (now - fps_timer),
                            last_complete_len,
                            (frames_shown ? (sum_dec_us / (double)frames_shown) / 1000.0 : 0.0),
                            (long)last_v4l2_hold,
-                           dropped_frames);
+                           skipped_stale);
                     frames_shown = 0;
                     sum_dec_us = 0;
                     fps_timer = now;
