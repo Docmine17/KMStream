@@ -3,7 +3,7 @@ PKG_CFG  ?= pkg-config
 ARCH     := $(shell uname -m)
 
 CFLAGS   ?= -O2 -pipe -flto
-CFLAGS   += -std=gnu11 -D_GNU_SOURCE -Wall -Wextra -Icommon -Iserver -MMD -MP
+CFLAGS   += -std=gnu11 -D_GNU_SOURCE -Wall -Wextra -Icommon -Iserver -Iclient -MMD -MP
 LDFLAGS  ?= -flto
 
 ifeq ($(ARCH),x86_64)
@@ -23,10 +23,10 @@ CLIENT_BIN := $(BUILD_DIR)/kmstream-pi
 SERVER_PKGS := libdrm gbm egl glesv2 libva libva-drm libavcodec libavutil
 CLIENT_PKGS := libdrm libavcodec libavutil
 
-SERVER_SRCS := server/kmstreamd.c server/sps_patch.c
+SERVER_SRCS := server/kmstreamd.c server/sps_patch.c server/capture_kms.c server/convert_egl.c server/encode_vaapi.c server/net_tx.c
 SERVER_OBJS := $(patsubst server/%.c,$(BUILD_DIR)/server/%.o,$(SERVER_SRCS))
 
-CLIENT_SRCS := client/kmstream_pi.c
+CLIENT_SRCS := client/kmstream_pi.c client/net_rx.c client/decode_v4l2.c client/display_kms.c
 CLIENT_OBJS := $(patsubst client/%.c,$(BUILD_DIR)/client/%.o,$(CLIENT_SRCS))
 
 .PHONY: all server client debug caps clean
@@ -56,7 +56,7 @@ $(BUILD_DIR)/client/%.o: client/%.c
 $(CLIENT_BIN): $(CLIENT_OBJS)
 	$(CC) $(LDFLAGS) $^ $(CLIENT_LIBS) -o $@
 
-debug: CFLAGS := -O0 -g3 -fsanitize=address,undefined -std=gnu11 -D_GNU_SOURCE -Wall -Wextra -Icommon -Iserver -MMD -MP
+debug: CFLAGS := -O0 -g3 -fsanitize=address,undefined -std=gnu11 -D_GNU_SOURCE -Wall -Wextra -Icommon -Iserver -Iclient -MMD -MP
 debug: LDFLAGS := -fsanitize=address,undefined
 debug: $(DEFAULT_TARGET)
 

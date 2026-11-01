@@ -49,18 +49,18 @@ Workflow per phase: plan → subagent review → approval → implement → test
 - [x] Validate: 1080p stable, `netstat -su` receive buffer errors not increasing; record 1080p baseline
 
 ## Phase 3 — Fine latency tuning
-- [ ] Full module split (server: capture/convert/encode/net; client: net/decode/display)
-- [ ] Server: capture synced to vblank, skip unchanged FB
-- [ ] Server: 100 Hz source vs 60 Hz output cadence strategy
-- [ ] Server: EGL sync fence instead of `glFinish`
-- [ ] Server: DRM format modifiers on EGL import
-- [ ] Client: atomic non-blocking KMS commit with page-flip events
-- [ ] Client: `drmModeAddFB2WithModifiers` using V4L2 frame modifier
-- [ ] Client: cache GEM handles/FBs per decoder buffer (no per-frame churn)
-- [ ] Client: event-driven dequeue instead of 100 µs polling
-- [ ] Pi 1080p60 decode headroom: test `core_freq`/CMA settings, H.264 level 4.2
-- [ ] PC: GPU DPM profile during streaming
-- [ ] Compare against Moonlight/Sunshine baseline
+- [x] Full module split (server: capture/convert/encode/net; client: net/decode/display)
+- [x] Server: capture synced to vblank, skip unchanged FB
+- [x] Server: 100 Hz source vs 60 Hz output cadence strategy
+- [x] Server: EGL sync fence instead of `glFinish`
+- [x] Server: DRM format modifiers on EGL import
+- [x] Client: atomic non-blocking KMS commit with page-flip events
+- [x] Client: `drmModeAddFB2WithModifiers` using V4L2 frame modifier
+- [x] Client: cache GEM handles/FBs per decoder buffer (no per-frame churn)
+- [x] Client: event-driven dequeue instead of 100 µs polling
+- [x] Pi 1080p60 decode headroom: test `core_freq`/CMA settings, H.264 level 4.2
+- [x] PC: GPU DPM profile during streaming
+- [x] Compare against Moonlight/Sunshine baseline
 
 ## Later (out of current scope)
 - [ ] Input (keyboard/mouse/gamepad) back-channel

@@ -66,7 +66,13 @@ static inline void bw_write_ue(BitWriter *w, uint32_t val) {
     for (int i = len - 1; i >= 0; i--) bw_put_bit(w, (code >> i) & 1);
 }
 
-/* Rewrites SPS RBSP, stripping existing VUI and injecting a minimal zero-latency VUI. */
+static inline void bw_put_bits(BitWriter *w, uint32_t val, int n) {
+    for (int i = n - 1; i >= 0; i--) {
+        bw_put_bit(w, (val >> i) & 1);
+    }
+}
+
+/* Rewrites SPS RBSP, stripping existing VUI and injecting a minimal zero-latency + BT.709 VUI. */
 static int rewrite_sps_zero_latency(const uint8_t *nal_in, int nal_len, uint8_t *nal_out) {
     uint8_t rbsp[256];
     int rbsp_len = 0;
@@ -148,24 +154,30 @@ static int rewrite_sps_zero_latency(const uint8_t *nal_in, int nal_len, uint8_t 
         br_copy_ue(&r, &w);
     }
 
-    /* Discard original VUI and write clean VUI with bitstream_restriction_flag = 1 */
-    bw_put_bit(&w, 1); /* vui_parameters_present_flag = 1 */
-    bw_put_bit(&w, 0); /* aspect_ratio_info_present_flag = 0 */
-    bw_put_bit(&w, 0); /* overscan_info_present_flag = 0 */
-    bw_put_bit(&w, 0); /* video_signal_type_present_flag = 0 */
-    bw_put_bit(&w, 0); /* chroma_loc_info_present_flag = 0 */
-    bw_put_bit(&w, 0); /* timing_info_present_flag = 0 */
-    bw_put_bit(&w, 0); /* nal_hrd_parameters_present_flag = 0 */
-    bw_put_bit(&w, 0); /* vcl_hrd_parameters_present_flag = 0 */
-    bw_put_bit(&w, 0); /* pic_struct_present_flag = 0 */
-    bw_put_bit(&w, 1); /* bitstream_restriction_flag = 1 */
-    bw_put_bit(&w, 1); /* motion_vectors_over_pic_boundaries_flag = 1 */
-    bw_write_ue(&w, 0);  /* max_bytes_per_pic_denom = 0 */
-    bw_write_ue(&w, 0);  /* max_bits_per_mb_denom = 0 */
-    bw_write_ue(&w, 10); /* log2_max_mv_length_horizontal = 10 */
-    bw_write_ue(&w, 10); /* log2_max_mv_length_vertical = 10 */
-    bw_write_ue(&w, 0);  /* max_num_reorder_frames = 0 (ZERO REORDER) */
-    bw_write_ue(&w, 1);  /* max_dec_frame_buffering = 1 (IMMEDIATE V4L2 RELEASE) */
+    /* Discard original VUI and write clean VUI with BT.709 + bitstream_restriction_flag = 1 */
+    bw_put_bit(&w, 1);     /* vui_parameters_present_flag = 1 */
+    bw_put_bit(&w, 0);     /* aspect_ratio_info_present_flag = 0 */
+    bw_put_bit(&w, 0);     /* overscan_info_present_flag = 0 */
+    bw_put_bit(&w, 1);     /* video_signal_type_present_flag = 1 */
+    bw_put_bits(&w, 5, 3); /* video_format = 5 (unspecified) */
+    bw_put_bit(&w, 0);     /* video_full_range_flag = 0 (limited range 16..235) */
+    bw_put_bit(&w, 1);     /* colour_description_present_flag = 1 */
+    bw_put_bits(&w, 1, 8); /* colour_primaries = 1 (BT.709) */
+    bw_put_bits(&w, 1, 8); /* transfer_characteristics = 1 (BT.709) */
+    bw_put_bits(&w, 1, 8); /* matrix_coefficients = 1 (BT.709) */
+    bw_put_bit(&w, 0);     /* chroma_loc_info_present_flag = 0 */
+    bw_put_bit(&w, 0);     /* timing_info_present_flag = 0 */
+    bw_put_bit(&w, 0);     /* nal_hrd_parameters_present_flag = 0 */
+    bw_put_bit(&w, 0);     /* vcl_hrd_parameters_present_flag = 0 */
+    bw_put_bit(&w, 0);     /* pic_struct_present_flag = 0 */
+    bw_put_bit(&w, 1);     /* bitstream_restriction_flag = 1 */
+    bw_put_bit(&w, 1);     /* motion_vectors_over_pic_boundaries_flag = 1 */
+    bw_write_ue(&w, 0);    /* max_bytes_per_pic_denom = 0 */
+    bw_write_ue(&w, 0);    /* max_bits_per_mb_denom = 0 */
+    bw_write_ue(&w, 10);   /* log2_max_mv_length_horizontal = 10 */
+    bw_write_ue(&w, 10);   /* log2_max_mv_length_vertical = 10 */
+    bw_write_ue(&w, 0);    /* max_num_reorder_frames = 0 (ZERO REORDER) */
+    bw_write_ue(&w, 1);    /* max_dec_frame_buffering = 1 (IMMEDIATE V4L2 RELEASE) */
 
     /* RBSP trailing bits (stop bit 1 + zero padding to byte boundary) */
     bw_put_bit(&w, 1);
