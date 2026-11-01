@@ -2,6 +2,7 @@
 #define KMSTREAM_NET_RX_H
 
 #include <stdint.h>
+#include <signal.h>
 #include <pthread.h>
 #include <netinet/in.h>
 #include "protocol.h"
@@ -25,13 +26,16 @@ struct rx_slot {
     uint16_t chunks_unique;
     uint8_t  flags;
     uint8_t  state;
+#if KMSTREAM_STATS
     uint64_t capture_ts_us;
     uint64_t t_rx_first_us;
     uint64_t t_rx_last_us;
     uint16_t t_convert_us;
     uint16_t t_encode_us;
+#endif
 };
 
+#if KMSTREAM_STATS
 struct frame_meta_slot {
     uint32_t frame_id;
     uint64_t capture_ts_us;
@@ -50,6 +54,7 @@ struct clock_sync {
     uint32_t seq;
     uint64_t last_ping_us;
 };
+#endif
 
 struct rx_shared {
     pthread_mutex_t mtx;
@@ -62,17 +67,24 @@ struct rx_shared {
     struct sockaddr_in srv_ctrl_addr;
     int                has_srv_addr;
 
+#if KMSTREAM_STATS
     struct clock_sync  cs;
+#endif
 
     uint32_t frames_incomplete;
     uint32_t idr_requests_sent;
     uint32_t last_completed_id;
     int      waiting_for_idr;
+    int      stream_reset_pending;
     uint64_t last_idr_req_us;
+    uint64_t last_rx_us;
     uint32_t idr_req_seq;
 };
 
-struct rx_shared *net_rx_init_and_start(void);
-void              net_rx_wait_for_ready(struct rx_shared *sh);
+struct rx_shared *net_rx_init_and_start(const volatile sig_atomic_t *stop_flag);
+int               net_rx_wait_for_ready(struct rx_shared *sh,
+                                        const volatile sig_atomic_t *stop_flag,
+                                        int is_blanked);
+void              net_rx_request_idr_locked(struct rx_shared *sh);
 
 #endif /* KMSTREAM_NET_RX_H */

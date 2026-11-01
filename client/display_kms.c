@@ -122,7 +122,6 @@ static uint32_t fb_cache_get_or_create(struct display_kms_ctx *ctx,
         }
     }
 
-    /* Cache full (unexpected since V4L2 capture queue has 6 buffers): invalidate and insert at 0 */
     fb_cache_invalidate_all(ctx);
     return fb_cache_get_or_create(ctx, desc, width, height);
 }
@@ -217,9 +216,15 @@ int display_kms_present(struct display_kms_ctx *ctx, AVFrame *frame) {
     }
 
     uint32_t fb_id = fb_cache_get_or_create(ctx, desc, frame->width, frame->height);
-    if (!fb_id) {
+    if (! fb_id) {
         av_frame_free(&frame);
         return -1;
+    }
+
+    if (ctx->cache_misses == 1 && ctx->cache_hits == 0) {
+        printf("[KMS] Presenting %dx%d stream on Plane %u (FB=%u)\n",
+               frame->width, frame->height, ctx->plane_id, fb_id);
+        fflush(stdout);
     }
 
     int committed = 0;
@@ -238,7 +243,6 @@ int display_kms_present(struct display_kms_ctx *ctx, AVFrame *frame) {
             drmModeAtomicAddProperty(req, ctx->plane_id, ctx->prop_src_w,   (uint64_t)frame->width  << 16);
             drmModeAtomicAddProperty(req, ctx->plane_id, ctx->prop_src_h,   (uint64_t)frame->height << 16);
 
-            /* First plane activation may require synchronous commit on some drivers */
             uint32_t flags = ctx->plane_activated ? DRM_MODE_ATOMIC_NONBLOCK : 0;
             int ret = drmModeAtomicCommit(ctx->drm_fd, req, flags, NULL);
             if (ret == 0) {
@@ -246,11 +250,6 @@ int display_kms_present(struct display_kms_ctx *ctx, AVFrame *frame) {
                 if (flags & DRM_MODE_ATOMIC_NONBLOCK) ctx->nonblock_commits++;
                 committed = 1;
             } else if (ret == -EBUSY) {
-                /*
-                 * Previous non-blocking page flip is still waiting for vblank.
-                 * Wait once synchronously so we stay phase-locked to HDMI vblank
-                 * without dropping or tearing, or let the new frame take the next vblank.
-                 */
                 ctx->ebusy_count++;
                 ret = drmModeAtomicCommit(ctx->drm_fd, req, 0, NULL);
                 if (ret == 0) committed = 1;
@@ -269,9 +268,9 @@ int display_kms_present(struct display_kms_ctx *ctx, AVFrame *frame) {
         drmModeSetPlane(ctx->drm_fd, ctx->plane_id, ctx->crtc_id, fb_id, 0,
                         0, 0, ctx->disp_w, ctx->disp_h,
                         0, 0, (uint32_t)frame->width << 16, (uint32_t)frame->height << 16);
+        ctx->plane_activated = 1;
     }
 
-    /* Keep 3 frames referenced in ring so V4L2 never overwrites active/pending scanout buffer */
     if (ctx->frame_ring[ctx->ring_idx]) {
         av_frame_free(&ctx->frame_ring[ctx->ring_idx]);
     }
@@ -281,11 +280,42 @@ int display_kms_present(struct display_kms_ctx *ctx, AVFrame *frame) {
     return 0;
 }
 
-void display_kms_cleanup(struct display_kms_ctx *ctx) {
+void display_kms_disable_plane(struct display_kms_ctx *ctx) {
+    if (ctx->drm_fd < 0) return;
+
+    int disabled = 0;
+    if (ctx->atomic_ready && ctx->plane_activated) {
+        drmModeAtomicReq *req = drmModeAtomicAlloc();
+        if (req) {
+            drmModeAtomicAddProperty(req, ctx->plane_id, ctx->prop_fb_id,   0);
+            drmModeAtomicAddProperty(req, ctx->plane_id, ctx->prop_crtc_id, 0);
+            if (drmModeAtomicCommit(ctx->drm_fd, req, 0, NULL) == 0) {
+                disabled = 1;
+            }
+            drmModeAtomicFree(req);
+        }
+    }
+    if (!disabled && ctx->plane_activated) {
+        drmModeSetPlane(ctx->drm_fd, ctx->plane_id, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    }
+    ctx->plane_activated = 0;
+
+    /*
+     * Always invalidate fb_cache and release frame_ring BEFORE V4L2 buffers
+     * are closed/reallocated so the kernel does not reuse the same dmabuf_fd
+     * integer for a new buffer while fb_cache still maps it to an old fb_id.
+     */
     fb_cache_invalidate_all(ctx);
+    ctx->cache_hits   = 0;
+    ctx->cache_misses = 0;
     for (int i = 0; i < KMS_FRAME_RING; i++) {
         if (ctx->frame_ring[i]) av_frame_free(&ctx->frame_ring[i]);
     }
+    ctx->ring_idx = 0;
+}
+
+void display_kms_cleanup(struct display_kms_ctx *ctx) {
+    display_kms_disable_plane(ctx);
     if (ctx->drm_fd >= 0) {
         close(ctx->drm_fd);
         ctx->drm_fd = -1;

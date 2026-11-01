@@ -17,12 +17,15 @@
     } \
 } while (0)
 
+static const volatile sig_atomic_t *g_rx_stop_flag = NULL;
+
 static inline uint64_t now_us(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
     return (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
 }
 
+#if KMSTREAM_STATS
 static void clock_sync_on_pong(struct clock_sync *cs, const struct kms_ctrl_pong *pong, uint64_t t3_us) {
     int64_t total_us = (int64_t)(t3_us - pong->t0_us);
     int64_t srv_us   = (int64_t)(pong->t2_us - pong->t1_us);
@@ -83,11 +86,12 @@ static void maybe_send_ping_locked(struct rx_shared *sh) {
     sendto(sh->ctrl_sock, &ping, sizeof(ping), MSG_DONTWAIT,
            (const struct sockaddr *)&sh->srv_ctrl_addr, sizeof(sh->srv_ctrl_addr));
 }
+#endif /* KMSTREAM_STATS */
 
 static void send_idr_request_locked(struct rx_shared *sh, uint64_t now) {
     sh->waiting_for_idr = 1;
     if (!sh->has_srv_addr) return;
-    if (now - sh->last_idr_req_us < 30000ULL) return;
+    if (now - sh->last_idr_req_us < 25000ULL) return;
     sh->last_idr_req_us = now;
     sh->idr_requests_sent++;
 
@@ -104,7 +108,15 @@ static void send_idr_request_locked(struct rx_shared *sh, uint64_t now) {
            (const struct sockaddr *)&sh->srv_ctrl_addr, sizeof(sh->srv_ctrl_addr));
 }
 
+void net_rx_request_idr_locked(struct rx_shared *sh) {
+    sh->last_idr_req_us = 0; /* force immediate send */
+    send_idr_request_locked(sh, now_us());
+}
+
 static void reset_slot(struct rx_slot *s, const struct kms_video_hdr *hdr, uint64_t t_pkt) {
+#if !KMSTREAM_STATS
+    (void)t_pkt;
+#endif
     uint16_t words = (uint16_t)((hdr->total_chunks + 63) / 64);
     if (words > BMAP_WORDS) words = BMAP_WORDS;
     memset(s->chunk_bmap, 0, (size_t)words * sizeof(uint64_t));
@@ -114,11 +126,13 @@ static void reset_slot(struct rx_slot *s, const struct kms_video_hdr *hdr, uint6
     s->chunks_unique = 0;
     s->flags         = hdr->flags;
     s->state         = SLOT_ASSEMBLING;
+#if KMSTREAM_STATS
     s->capture_ts_us = hdr->capture_ts_us;
     s->t_rx_first_us = t_pkt;
     s->t_rx_last_us  = t_pkt;
     s->t_convert_us  = hdr->t_convert_us;
     s->t_encode_us   = hdr->t_encode_us;
+#endif
 }
 
 static void *rx_thread_fn(void *arg) {
@@ -126,19 +140,24 @@ static void *rx_thread_fn(void *arg) {
     uint8_t pkt_buf[sizeof(struct kms_video_hdr) + KMS_CHUNK_SIZE + 64];
     int cur_slot_idx = -1;
     uint32_t cur_frame_id = 0;
+    int version_mismatch_logged = 0;
 
     struct pollfd pfds[2] = {
         { .fd = sh->video_sock, .events = POLLIN },
         { .fd = sh->ctrl_sock,  .events = POLLIN },
     };
 
-    while (1) {
+    while (!g_rx_stop_flag || !*g_rx_stop_flag) {
         poll(pfds, 2, 20);
+        if (g_rx_stop_flag && *g_rx_stop_flag) break;
 
         pthread_mutex_lock(&sh->mtx);
+#if KMSTREAM_STATS
         drain_ctrl_pongs_locked(sh);
         maybe_send_ping_locked(sh);
-        if (sh->waiting_for_idr) {
+#endif
+        if (sh->waiting_for_idr && sh->last_rx_us > 0 &&
+            (now_us() - sh->last_rx_us) < 1000000ULL) {
             send_idr_request_locked(sh, now_us());
         }
         pthread_mutex_unlock(&sh->mtx);
@@ -152,7 +171,15 @@ static void *rx_thread_fn(void *arg) {
 
             uint64_t t_pkt = now_us();
             const struct kms_video_hdr *hdr = (const struct kms_video_hdr *)pkt_buf;
-            if (hdr->version != KMS_PROTO_VERSION) continue;
+            if (hdr->version != KMS_PROTO_VERSION) {
+                if (!version_mismatch_logged) {
+                    fprintf(stderr,
+                            "[NET] Protocol version mismatch: got v%u, expected v%u (ensure both PC and Pi are compiled with same stats=0/1 mode)\n",
+                            hdr->version, KMS_PROTO_VERSION);
+                    version_mismatch_logged = 1;
+                }
+                continue;
+            }
             if (hdr->total_chunks == 0 || hdr->total_chunks > KMS_MAX_CHUNKS) continue;
             if (hdr->chunk_idx >= hdr->total_chunks || hdr->payload_len > KMS_CHUNK_SIZE) continue;
             if ((size_t)n < sizeof(struct kms_video_hdr) + hdr->payload_len) continue;
@@ -160,21 +187,39 @@ static void *rx_thread_fn(void *arg) {
             const uint8_t *payload = pkt_buf + sizeof(struct kms_video_hdr);
 
             pthread_mutex_lock(&sh->mtx);
-            if (!sh->has_srv_addr) {
+            sh->last_rx_us = t_pkt;
+            if (!sh->has_srv_addr || sh->srv_ctrl_addr.sin_addr.s_addr != peer.sin_addr.s_addr) {
                 sh->srv_ctrl_addr = peer;
                 sh->srv_ctrl_addr.sin_port = htons(KMS_CTRL_PORT);
                 sh->has_srv_addr = 1;
+#if KMSTREAM_STATS
                 maybe_send_ping_locked(sh);
+#endif
             }
 
-            if (hdr->frame_id < cur_frame_id && (hdr->flags & KMS_FLAG_IDR) && hdr->frame_id <= 10) {
+            /*
+             * Detect new server session (cur_frame_id > 5 and server restarted at frame_id <= 5).
+             * Only trigger stream_reset_pending once per restart (when cur_frame_id > 5),
+             * and signal the main thread ONLY when the new IDR frame is fully assembled
+             * (or immediately if frame 1 was missed so main thread can request IDR).
+             */
+            if ((cur_frame_id > 1 && hdr->frame_id == 1 && (hdr->flags & KMS_FLAG_IDR)) ||
+                (cur_frame_id > 15 && hdr->frame_id <= 5 &&
+                 ((hdr->flags & KMS_FLAG_STREAM_RESET) || (hdr->flags & KMS_FLAG_IDR)))) {
                 cur_frame_id = 0;
                 sh->last_completed_id = 0;
-                sh->waiting_for_idr = 0;
-                if (cur_slot_idx >= 0 && sh->slots[cur_slot_idx].state == SLOT_ASSEMBLING) {
-                    sh->slots[cur_slot_idx].state = SLOT_FREE;
+                sh->waiting_for_idr = 1;
+                sh->stream_reset_pending = 1;
+                for (int i = 0; i < RX_RING_SLOTS; i++) {
+                    if (sh->slots[i].state != SLOT_SENDING) {
+                        sh->slots[i].state = SLOT_FREE;
+                    }
                 }
                 cur_slot_idx = -1;
+                if (!(hdr->flags & KMS_FLAG_IDR)) {
+                    net_rx_request_idr_locked(sh);
+                    pthread_cond_signal(&sh->cond);
+                }
             }
 
             if (hdr->frame_id < cur_frame_id && (cur_frame_id - hdr->frame_id) < 10000) {
@@ -190,6 +235,8 @@ static void *rx_thread_fn(void *arg) {
                 } else if (sh->last_completed_id > 0 && hdr->frame_id > sh->last_completed_id + 1 &&
                            !(hdr->flags & KMS_FLAG_IDR)) {
                     sh->frames_incomplete += (hdr->frame_id - sh->last_completed_id - 1);
+                    send_idr_request_locked(sh, t_pkt);
+                } else if (sh->last_completed_id == 0 && !(hdr->flags & KMS_FLAG_IDR)) {
                     send_idr_request_locked(sh, t_pkt);
                 }
 
@@ -238,7 +285,9 @@ static void *rx_thread_fn(void *arg) {
                     }
 
                     if (s->chunks_unique == s->total_chunks && s->frame_size > 0) {
+#if KMSTREAM_STATS
                         s->t_rx_last_us = t_pkt;
+#endif
                         s->state = SLOT_READY;
                         sh->last_completed_id = s->frame_id;
                         if (s->flags & KMS_FLAG_IDR) {
@@ -255,7 +304,9 @@ static void *rx_thread_fn(void *arg) {
     return NULL;
 }
 
-struct rx_shared *net_rx_init_and_start(void) {
+struct rx_shared *net_rx_init_and_start(const volatile sig_atomic_t *stop_flag) {
+    g_rx_stop_flag = stop_flag;
+
     int sock = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     DIE_IF(sock < 0, "socket: %s", strerror(errno));
     int req_rcvbuf = 4 * 1024 * 1024;
@@ -279,28 +330,43 @@ struct rx_shared *net_rx_init_and_start(void) {
     DIE_IF(!sh, "calloc rx_shared failed");
     pthread_mutex_init(&sh->mtx, NULL);
     pthread_cond_init(&sh->cond, NULL);
-    sh->video_sock    = sock;
-    sh->ctrl_sock     = ctrl_sock;
-    sh->actual_rcvbuf = actual_rcvbuf;
+    sh->video_sock      = sock;
+    sh->ctrl_sock       = ctrl_sock;
+    sh->actual_rcvbuf   = actual_rcvbuf;
+    sh->waiting_for_idr = 1;
 
     pthread_t rx_tid;
     DIE_IF(pthread_create(&rx_tid, NULL, rx_thread_fn, sh) != 0, "pthread_create failed");
+    pthread_detach(rx_tid);
     return sh;
 }
 
-void net_rx_wait_for_ready(struct rx_shared *sh) {
+int net_rx_wait_for_ready(struct rx_shared *sh,
+                          const volatile sig_atomic_t *stop_flag,
+                          int is_blanked) {
     while (1) {
-        int has_ready = 0;
+        if (stop_flag && *stop_flag) {
+            return -1;
+        }
+        int has_ready = sh->stream_reset_pending;
         for (int i = 0; i < RX_RING_SLOTS; i++) {
             if (sh->slots[i].state == SLOT_READY) {
                 has_ready = 1;
                 break;
             }
         }
-        if (has_ready) break;
+        if (has_ready) {
+            return 1;
+        }
+        if (!is_blanked && sh->last_rx_us > 0 &&
+            (now_us() - sh->last_rx_us) >= 2000000ULL) {
+            return 0;
+        }
+
         struct timespec wait_ts;
         clock_gettime(CLOCK_REALTIME, &wait_ts);
-        wait_ts.tv_nsec += 50000000L;
+        long sleep_ns = is_blanked ? 200000000L : 50000000L;
+        wait_ts.tv_nsec += sleep_ns;
         if (wait_ts.tv_nsec >= 1000000000L) {
             wait_ts.tv_sec++;
             wait_ts.tv_nsec -= 1000000000L;

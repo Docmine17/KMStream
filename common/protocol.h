@@ -5,16 +5,21 @@
 
 _Static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__, "little-endian required");
 
-#define KMS_PROTO_VERSION 1
+#ifndef KMSTREAM_STATS
+#define KMSTREAM_STATS 0
+#endif
+
+#define KMS_PROTO_VERSION (1 + (KMSTREAM_STATS ? 128 : 0))
 #define KMS_VIDEO_PORT    5000   /* PC -> Pi */
 #define KMS_CTRL_PORT     5001   /* Pi -> PC (back-channel) */
-#define KMS_CHUNK_SIZE    1400   /* header (32) + payload (1400) < 1472 (MTU 1500) */
+#define KMS_CHUNK_SIZE    1400   /* header (16 or 32) + payload (1400) < 1472 (MTU 1500) */
 #define KMS_MAX_FRAME     (2 * 1024 * 1024)
 #define KMS_MAX_CHUNKS    ((KMS_MAX_FRAME + KMS_CHUNK_SIZE - 1) / KMS_CHUNK_SIZE)
 
 enum {
-    KMS_FLAG_IDR         = 1 << 0,
-    KMS_FLAG_SPS_PATCHED = 1 << 1,
+    KMS_FLAG_IDR          = 1 << 0,
+    KMS_FLAG_SPS_PATCHED  = 1 << 1,
+    KMS_FLAG_STREAM_RESET = 1 << 2,
 };
 
 struct __attribute__((packed)) kms_video_hdr {
@@ -25,14 +30,17 @@ struct __attribute__((packed)) kms_video_hdr {
     uint16_t payload_len;
     uint32_t frame_id;
     uint32_t frame_size;         /* total frame size in bytes (detects loss of last chunk) */
-    uint64_t capture_ts_us;      /* PC CLOCK_MONOTONIC_RAW timestamp (filled in Phase 1) */
-    uint16_t t_convert_us;       /* GLES RGB->NV12 conversion time (Phase 1) */
-    uint16_t t_encode_us;        /* VAAPI encode time (Phase 1) */
-    uint8_t  slice_idx;          /* multi-slice index (Phase 2/3) */
-    uint8_t  total_slices;       /* total slices in frame (Phase 2/3) */
+#if KMSTREAM_STATS
+    uint64_t capture_ts_us;      /* PC CLOCK_MONOTONIC_RAW timestamp */
+    uint16_t t_convert_us;       /* GLES RGB->NV12 conversion time */
+    uint16_t t_encode_us;        /* VAAPI encode time */
+    uint8_t  slice_idx;          /* multi-slice index */
+    uint8_t  total_slices;       /* total slices in frame */
     uint16_t reserved;
+#endif
 };
-_Static_assert(sizeof(struct kms_video_hdr) == 32, "kms_video_hdr must be 32 bytes");
+_Static_assert(sizeof(struct kms_video_hdr) == (KMSTREAM_STATS ? 32 : 16),
+               "kms_video_hdr size mismatch");
 
 enum kms_ctrl_type {
     KMS_CTRL_IDR_REQUEST = 1,
@@ -56,6 +64,7 @@ struct __attribute__((packed)) kms_ctrl_idr_request {
 };
 _Static_assert(sizeof(struct kms_ctrl_idr_request) == 12, "kms_ctrl_idr_request size mismatch");
 
+#if KMSTREAM_STATS
 struct __attribute__((packed)) kms_ctrl_nack {
     struct kms_ctrl_hdr h;
     uint32_t frame_id;
@@ -91,5 +100,6 @@ struct __attribute__((packed)) kms_ctrl_stats {
     uint16_t display_us_p99;
 };
 _Static_assert(sizeof(struct kms_ctrl_stats) == 36, "kms_ctrl_stats size mismatch");
+#endif /* KMSTREAM_STATS */
 
 #endif /* KMSTREAM_PROTOCOL_H */

@@ -54,6 +54,7 @@ struct display_kms_ctx {
 
 void display_kms_init(struct display_kms_ctx *ctx);
 int  display_kms_present(struct display_kms_ctx *ctx, AVFrame *frame);
+void display_kms_disable_plane(struct display_kms_ctx *ctx);
 void display_kms_cleanup(struct display_kms_ctx *ctx);
 
 #endif /* KMSTREAM_DISPLAY_KMS_H */

@@ -58,11 +58,16 @@ sudo apt install build-essential pkg-config rsync libdrm-dev libavcodec-dev liba
 
 ## Build
 
-The `Makefile` auto-detects the host architecture (`x86_64` builds `server`, `aarch64` builds `client`):
+The `Makefile` auto-detects the host architecture (`x86_64` builds `server`, `aarch64` builds `client`).
+By default, `make` builds the **lean Release profile** (`-O3 -DNDEBUG -flto -s`, 16-byte wire header, zero periodic stdout/telemetry overhead).
+Pass `stats=1` (or `--stats` to `deploy_pi.sh`) to enable per-stage microsecond telemetry, `PING`/`PONG` clock sync, and `--dump`/`--frames` flags.
 
 ```bash
-# On PC -> builds build/kmstreamd
+# On PC -> builds lean Release build/kmstreamd
 make
+
+# Or build with full latency telemetry enabled (32-byte wire header):
+make stats=1
 
 # Grant CAP_SYS_ADMIN so kmstreamd can read KMS framebuffers without sudo
 make caps
@@ -73,9 +78,14 @@ make client
 
 ### Deploy & Build on the Pi from PC
 ```bash
+# Deploy and build lean Release client on Pi:
 ./scripts/deploy_pi.sh
-# Or deploy, build, and launch immediately:
+
+# Deploy, build, and launch immediately:
 ./scripts/deploy_pi.sh --run
+
+# Deploy and build with telemetry enabled (must match `make stats=1` on PC):
+./scripts/deploy_pi.sh --stats
 ```
 
 ## Usage
@@ -89,6 +99,7 @@ sudo ./scripts/pi_tuning.sh
 sudo ./scripts/pi_tuning.sh --overclock-vpu
 
 # Start the client (from a TTY / without a desktop compositor holding DRM master)
+# Automatically blanks the KMS plane after 2s idle and reconfigures on 720p <-> 1080p switches.
 ./build/kmstream-pi
 ```
 
@@ -106,7 +117,7 @@ sudo ./scripts/pi_tuning.sh --overclock-vpu
 # Optional: use capped VBR (e.g. 20 Mbps) instead of default CQP (24 for 720p, 26 for 1080p):
 ./build/kmstreamd --bitrate 20 10.42.0.92 /dev/dri/card1 1080
 
-# Debug: dump patched H.264 Annex-B bitstream for N frames:
+# Debug (requires `make stats=1`): dump patched H.264 Annex-B bitstream for N frames:
 ./build/kmstreamd --dump sample.h264 --frames 120 10.42.0.92 /dev/dri/card1 720
 ```
 

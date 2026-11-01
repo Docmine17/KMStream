@@ -13,7 +13,6 @@ Workflow per phase: plan → subagent review → approval → implement → test
 - [x] `.gitignore` (binaries, build dirs), `.editorconfig` (LF, 4 spaces)
 - [x] Convert sources CRLF → LF
 - [x] Remove committed binary `server/kmstreamd-live` from git
-- [x] Move reference PDF to `docs/`
 - [x] `common/protocol.h` designed upfront: video header (frame_id, chunk idx/total, flags, capture timestamp, per-stage timings) + back-channel messages (IDR request, NACK, clock ping/pong, stats)
 - [x] Light split only: extract `sps_patch.c` and `protocol.h`; full module split deferred until network is stable
 - [x] Translate comments/log strings to English
@@ -61,6 +60,14 @@ Workflow per phase: plan → subagent review → approval → implement → test
 - [x] Pi 1080p60 decode headroom: test `core_freq`/CMA settings, H.264 level 4.2
 - [x] PC: GPU DPM profile during streaming
 - [x] Compare against Moonlight/Sunshine baseline
+
+## Phase 4 — Lean Release & Lifecycle Hardening (Screen Mirroring)
+- [x] Compile-time telemetry toggle (`KMSTREAM_STATS=0` default Release, `make stats=1` / `./scripts/deploy_pi.sh --stats` for telemetry & debug flags)
+- [x] Compact 16-byte `kms_video_hdr` in Release mode (32-byte header and `PING`/`PONG` clock sync compiled only when `KMSTREAM_STATS=1`)
+- [x] Release compiler flags (`-O3 -DNDEBUG -flto -s`) with zero periodic `stdout` I/O in hot loops
+- [x] Clean `SIGINT` / `SIGTERM` shutdown on both server and client (disable KMS plane and release resources on exit)
+- [x] Automatic KMS plane disable after ~2s idle timeout on Pi, plus seamless decoder re-init on server restart / resolution switch (`720p <-> 1080p`)
+- [x] Validate Release and `stats=1` builds on PC and Pi hardware
 
 ## Later (out of current scope)
 - [ ] Input (keyboard/mouse/gamepad) back-channel

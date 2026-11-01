@@ -1,10 +1,19 @@
 CC       ?= gcc
 PKG_CFG  ?= pkg-config
 ARCH     := $(shell uname -m)
+stats    ?= 0
 
-CFLAGS   ?= -O2 -pipe -flto
+ifeq ($(stats),1)
+  CFLAGS  ?= -O2 -pipe -flto
+  CFLAGS  += -DKMSTREAM_STATS=1
+  LDFLAGS ?= -flto
+else
+  CFLAGS  ?= -O3 -pipe -flto -DNDEBUG
+  CFLAGS  += -DKMSTREAM_STATS=0
+  LDFLAGS ?= -flto -s
+endif
+
 CFLAGS   += -std=gnu11 -D_GNU_SOURCE -Wall -Wextra -Icommon -Iserver -Iclient -MMD -MP
-LDFLAGS  ?= -flto
 
 ifeq ($(ARCH),x86_64)
   CFLAGS += -march=native
@@ -17,6 +26,7 @@ else
 endif
 
 BUILD_DIR  := build
+MODE_FILE  := $(BUILD_DIR)/.build_mode
 SERVER_BIN := $(BUILD_DIR)/kmstreamd
 CLIENT_BIN := $(BUILD_DIR)/kmstream-pi
 
@@ -29,7 +39,7 @@ SERVER_OBJS := $(patsubst server/%.c,$(BUILD_DIR)/server/%.o,$(SERVER_SRCS))
 CLIENT_SRCS := client/kmstream_pi.c client/net_rx.c client/decode_v4l2.c client/display_kms.c
 CLIENT_OBJS := $(patsubst client/%.c,$(BUILD_DIR)/client/%.o,$(CLIENT_SRCS))
 
-.PHONY: all server client debug caps clean
+.PHONY: all server client debug caps clean FORCE
 
 SERVER_CFLAGS = $(shell $(PKG_CFG) --cflags $(SERVER_PKGS))
 SERVER_LIBS   = $(shell $(PKG_CFG) --libs $(SERVER_PKGS))
@@ -42,21 +52,30 @@ server: $(SERVER_BIN)
 
 client: $(CLIENT_BIN)
 
-$(BUILD_DIR)/server/%.o: server/%.c
+$(MODE_FILE): FORCE
+	@mkdir -p $(BUILD_DIR)
+	@echo "stats=$(stats)" > $(MODE_FILE).tmp
+	@if ! cmp -s $(MODE_FILE).tmp $(MODE_FILE) 2>/dev/null; then \
+		mv $(MODE_FILE).tmp $(MODE_FILE); \
+	else \
+		rm -f $(MODE_FILE).tmp; \
+	fi
+
+$(BUILD_DIR)/server/%.o: server/%.c $(MODE_FILE)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(SERVER_CFLAGS) -c $< -o $@
 
 $(SERVER_BIN): $(SERVER_OBJS)
 	$(CC) $(LDFLAGS) $^ $(SERVER_LIBS) -o $@
 
-$(BUILD_DIR)/client/%.o: client/%.c
+$(BUILD_DIR)/client/%.o: client/%.c $(MODE_FILE)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(CLIENT_CFLAGS) -c $< -o $@
 
 $(CLIENT_BIN): $(CLIENT_OBJS)
 	$(CC) $(LDFLAGS) $^ $(CLIENT_LIBS) -o $@
 
-debug: CFLAGS := -O0 -g3 -fsanitize=address,undefined -std=gnu11 -D_GNU_SOURCE -Wall -Wextra -Icommon -Iserver -Iclient -MMD -MP
+debug: CFLAGS := -O0 -g3 -fsanitize=address,undefined -std=gnu11 -D_GNU_SOURCE -Wall -Wextra -Icommon -Iserver -Iclient -DKMSTREAM_STATS=1 -MMD -MP
 debug: LDFLAGS := -fsanitize=address,undefined
 debug: $(DEFAULT_TARGET)
 

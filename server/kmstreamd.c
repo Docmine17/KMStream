@@ -6,10 +6,13 @@
 #include <string.h>
 #include <errno.h>
 #include <getopt.h>
+#include <signal.h>
 #include <time.h>
 
 #include "protocol.h"
+#if KMSTREAM_STATS
 #include "stats.h"
+#endif
 #include "capture_kms.h"
 #include "convert_egl.h"
 #include "encode_vaapi.h"
@@ -22,6 +25,13 @@
     } \
 } while (0)
 
+static volatile sig_atomic_t g_stop = 0;
+
+static void on_signal(int sig) {
+    (void)sig;
+    g_stop = 1;
+}
+
 static inline uint64_t now_us(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
@@ -29,33 +39,51 @@ static inline uint64_t now_us(void) {
 }
 
 static void usage(const char *prog) {
+#if KMSTREAM_STATS
     fprintf(stderr,
             "Usage: %s [--fps <FPS>] [--bitrate <Mbps>] [--dump <file.h264>] [--frames <N>] <PI_IP> [/dev/dri/card1] [1080|720]\n",
             prog);
+#else
+    fprintf(stderr,
+            "Usage: %s [--fps <FPS>] [--bitrate <Mbps>] <PI_IP> [/dev/dri/card1] [1080|720]\n",
+            prog);
+#endif
 }
 
 int main(int argc, char **argv) {
+#if KMSTREAM_STATS
     const char *dump_path = NULL;
     uint32_t max_frames = 0;
+#endif
     int bitrate_mbps = 0;
     int target_fps = 0;
 
     static const struct option long_opts[] = {
         { "fps",     required_argument, NULL, 'f' },
         { "bitrate", required_argument, NULL, 'b' },
+#if KMSTREAM_STATS
         { "dump",    required_argument, NULL, 'd' },
         { "frames",  required_argument, NULL, 'n' },
+#endif
         { "help",    no_argument,       NULL, 'h' },
         { NULL, 0, NULL, 0 }
     };
 
+#if KMSTREAM_STATS
+    const char *optstr = "f:b:d:n:h";
+#else
+    const char *optstr = "f:b:h";
+#endif
+
     int opt;
-    while ((opt = getopt_long(argc, argv, "f:b:d:n:h", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, optstr, long_opts, NULL)) != -1) {
         switch (opt) {
         case 'f': target_fps = atoi(optarg); break;
         case 'b': bitrate_mbps = atoi(optarg); break;
+#if KMSTREAM_STATS
         case 'd': dump_path = optarg; break;
         case 'n': max_frames = (uint32_t)strtoul(optarg, NULL, 10); break;
+#endif
         case 'h':
         default:
             usage(argv[0]);
@@ -68,17 +96,24 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    struct sigaction sa = {0};
+    sa.sa_handler = on_signal;
+    sigaction(SIGINT,  &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+
     const char *pi_ip = argv[optind];
     const char *card = (argc - optind > 1) ? argv[optind + 1] : "/dev/dri/card1";
     int use_720p = (argc - optind > 2 && atoi(argv[optind + 2]) == 720) ? 1 : 0;
     if (target_fps <= 0) target_fps = use_720p ? 60 : 50;
     uint64_t frame_interval_us = 1000000ULL / (uint64_t)target_fps;
 
+#if KMSTREAM_STATS
     FILE *dump_fp = NULL;
     if (dump_path) {
         dump_fp = fopen(dump_path, "wb");
         DIE_IF(!dump_fp, "failed to open dump file '%s': %s", dump_path, strerror(errno));
     }
+#endif
 
     struct net_tx_ctx net;
     net_tx_init(&net, pi_ip);
@@ -97,8 +132,9 @@ int main(int argc, char **argv) {
     egl_convert_init(&egl, enc_w, enc_h, &prime);
     vaapi_enc_close_prime(&prime);
 
-    printf("=== KMStream Server (proto v%d, %s @ %d FPS + Pacing + EGLSync) (%dx%d -> %dx%d) | Primary: %u | Cursor: %u ===\n",
-           KMS_PROTO_VERSION,
+    printf("=== KMStream Server (%s, hdr=%zub, %s @ %d FPS) (%dx%d -> %dx%d) | Primary: %u | Cursor: %u ===\n",
+           KMSTREAM_STATS ? "STATS" : "RELEASE",
+           sizeof(struct kms_video_hdr),
            bitrate_mbps > 0 ? "VBR" : (use_720p ? "CQP24" : "CQP26"),
            target_fps, cap.src_w, cap.src_h, enc_w, enc_h,
            cap.primary_plane_id, cap.cursor_plane_id);
@@ -106,17 +142,27 @@ int main(int argc, char **argv) {
 
     uint32_t frame_id = 1;
     uint64_t next_frame_tick = now_us();
+
+#if KMSTREAM_STATS
     uint64_t stat_timer = next_frame_tick;
-
     struct kms_stat_win st_conv = {0}, st_enc = {0}, st_tx = {0}, st_sz = {0};
+#endif
 
-    while (!max_frames || frame_id <= max_frames) {
-        net_tx_wait_until(&net, next_frame_tick);
+    while (!g_stop
+#if KMSTREAM_STATS
+           && (!max_frames || frame_id <= max_frames)
+#endif
+    ) {
+        net_tx_wait_until(&net, next_frame_tick, &g_stop);
+        if (g_stop) break;
+
         uint64_t now = now_us();
         next_frame_tick += frame_interval_us;
         if (now > next_frame_tick + 30000) next_frame_tick = now;
 
+#if KMSTREAM_STATS
         uint64_t t_cap0 = now;
+#endif
 
         struct kms_captured_plane prim, cur;
         if (kms_capture_acquire(&cap, &prim, &cur) < 0) {
@@ -129,8 +175,11 @@ int main(int argc, char **argv) {
             kms_capture_release_plane(&prim);
             continue;
         }
+
+#if KMSTREAM_STATS
         uint64_t t_conv_end = now_us();
         uint64_t conv_us = t_conv_end - t_cap0;
+#endif
 
         net_tx_drain_ctrl(&net);
 
@@ -143,6 +192,7 @@ int main(int argc, char **argv) {
         uint8_t flags = 0;
 
         while (vaapi_enc_receive(&enc, &send_ptr, &send_size, &flags) == 0) {
+#if KMSTREAM_STATS
             uint64_t t_enc_end = now_us();
             uint64_t enc_us = t_enc_end - t_conv_end;
 
@@ -160,7 +210,9 @@ int main(int argc, char **argv) {
             kms_stat_add(&st_enc,  (uint32_t)enc_us);
             kms_stat_add(&st_tx,   (uint32_t)tx_us);
             kms_stat_add(&st_sz,   (uint32_t)send_size);
-
+#else
+            net_tx_send_frame(&net, frame_id, send_ptr, send_size, flags, 0, 0, 0);
+#endif
             frame_id++;
             vaapi_enc_unref_pkt(&enc);
         }
@@ -169,6 +221,7 @@ int main(int argc, char **argv) {
         kms_capture_release_plane(&prim);
         net_tx_drain_ctrl(&net);
 
+#if KMSTREAM_STATS
         uint64_t t_log = now_us();
         if (t_log - stat_timer >= 2000000ULL && st_conv.count > 0) {
             uint32_t conv_avg, conv_p99, enc_avg, enc_p99, tx_avg, tx_p99, sz_avg, sz_p99;
@@ -204,8 +257,14 @@ int main(int argc, char **argv) {
             kms_stat_reset(&st_sz);
             stat_timer = t_log;
         }
+#endif
     }
 
+#if KMSTREAM_STATS
     if (dump_fp) fclose(dump_fp);
+#endif
+    net_tx_cleanup(&net);
+    if (cap.drm_fd >= 0) close(cap.drm_fd);
+    printf("[kmstreamd] Stopped cleanly.\n");
     return 0;
 }

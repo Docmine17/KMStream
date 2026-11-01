@@ -11,11 +11,13 @@
 #define DIE(fmt, ...) do { fprintf(stderr, "FATAL: " fmt "\n", ##__VA_ARGS__); exit(1); } while(0)
 #define DIE_IF(cond, fmt, ...) do { if (cond) DIE(fmt, ##__VA_ARGS__); } while(0)
 
+#if KMSTREAM_STATS
 static inline uint64_t now_us(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
     return (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
 }
+#endif
 
 static enum AVPixelFormat get_drm_format(AVCodecContext *ctx, const enum AVPixelFormat *pix_fmts) {
     (void)ctx;
@@ -53,15 +55,25 @@ void decode_v4l2_init(struct decode_v4l2_ctx *ctx) {
     DIE_IF(!ctx->pkt, "av_packet_alloc failed");
 }
 
+void decode_v4l2_reset(struct decode_v4l2_ctx *ctx) {
+    decode_v4l2_cleanup(ctx);
+    decode_v4l2_init(ctx);
+}
+
 AVFrame *decode_v4l2_step(struct decode_v4l2_ctx *ctx, const uint8_t *data,
                           uint32_t size, uint32_t cur_frame_id,
                           uint64_t *t_send_done_out) {
+#if !KMSTREAM_STATS
+    (void)t_send_done_out;
+#endif
     ctx->pkt->data = (uint8_t *)data;
     ctx->pkt->size = (int)size;
     ctx->pkt->pts  = (int64_t)cur_frame_id;
 
     int ret = avcodec_send_packet(ctx->dec_ctx, ctx->pkt);
-    *t_send_done_out = now_us();
+#if KMSTREAM_STATS
+    if (t_send_done_out) *t_send_done_out = now_us();
+#endif
     if (ret < 0 && ret != AVERROR(EAGAIN)) {
         return NULL;
     }
@@ -75,7 +87,7 @@ AVFrame *decode_v4l2_step(struct decode_v4l2_ctx *ctx, const uint8_t *data,
      * achieves Hold: 0f (~14.5 ms E2E) at 60 FPS.
      * In 1080p (> 720p, 2.26x macroblocks), VPU decode overlaps with the next frame
      * interval; returning as soon as a decoded frame is ready (0.02 ms) keeps VPU
-     * and non-blocking atomic KMS pipelined at full 50-55 FPS with ~20 ms E2E.
+     * and non-blocking atomic KMS pipelined at full 50-55 FPS with ~41-44 ms E2E.
      */
     for (int poll_iter = 0; poll_iter < 42; poll_iter++) {
         while (1) {
