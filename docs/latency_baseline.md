@@ -66,3 +66,21 @@ Captured over a 13-second run (780 frames) at `1280x720 @ 60 fps` (from `1920x10
    - **`Hold: 1f` (`+16.67 ms`):** `wait_deadline = 4.5 ms` expires just before `bcm2835-codec` finishes `cur_frame_id` (or V4L2 needs 1 extra output/capture buffer cue), so every iteration displays `cur_frame_id - 1`.
    - **Synchronous `drmModeSetPlane` (`+5.5 to 12.0 ms`):** blocks the single thread until the next 60 Hz HDMI vblank.
    - **Single-thread socket queueing (`+0 to 10.7 ms`):** while the thread is blocked for `4.6 ms (Dec) + 12.0 ms (KMS) = 16.6 ms`, the next frame arrives from the PC and sits in the kernel UDP socket buffer for up to `10.7 ms` before `recvfrom()` is called (also delaying `PONG` reception).
+
+---
+
+## 4. Recorded Numbers After Phase 2 (Network & Pipeline Robustness)
+
+Changes in Phase 2:
+- Dedicated `rx_thread` on the Pi (`SO_RCVBUF = 8192 KB` effective) with 8-slot ring + chunk bitmap + automatic `KMS_CTRL_IDR_REQUEST` recovery.
+- Server UDP packet pacing (~80 Mbps ceiling for bursts `> 6` chunks) + CQP24 (720p) / CQP26 (1080p) with long GOP (`600`) and on-demand IDR.
+- V4L2 M2M buffers increased (`num_output_buffers=4`, `num_capture_buffers=6`), immediate exit from decode poll once a frame is dequeued (`0.02 ms` wait), and `frame_ring[3]` keeping `AVFrame` alive across KMS scanout.
+
+| Mode | FPS (Pi) | Packet/Frame Loss (`Inc` / `rcvbuf`) | Link RTT | Pi `Net+Rx` | Pi `Dec` Wait | Pi `KMS` | `Hold` | **Software E2E (avg / p99)** |
+|---|---|---|---|---|---|---|---|---|
+| **720p @ 60 FPS** | **60.0 FPS** | `0 / 0` | `0.33 ms` | `0.56 + 0.50 ms` | **`0.02 / 0.04 ms`** | `9.20 / 10.05 ms` | `1f` | **`28.65 / 28.82 ms`** |
+| **1080p @ 30 FPS** | **30.0 FPS** | `0 / 0` | `0.44 ms` | `1.09 + 2.59 ms` | **`0.02 / 0.04 ms`** | `9.68 / 11.89 ms` | `1f` | **`49.40 / 49.71 ms`** |
+| **1080p @ 48 FPS** | **48.0 FPS** | `0 / 0` | `0.30 ms` | `1.70 + 1.65 ms` | **`0.02 / 0.04 ms`** | `9.22 / 16.92 ms` | `2f` | **`56.74 / 67.20 ms`** |
+| **1080p @ 54 FPS** | **54.0 FPS** | `0 / 0` | `0.42 ms` | `4.87 + 2.53 ms` | **`0.12 / 2.11 ms`** | `9.49 / 17.06 ms` | `2f` | **`57.56 / 67.69 ms`** |
+
+> **Hardware Note on 1080p60:** At default Raspberry Pi 3B clocks (`core_freq=400 MHz`, `h264_freq=250 MHz`), the VideoCore IV hardware H.264 block reaches a maximum physical throughput of **55.5 FPS** at `1920x1080` (~452k macroblocks/s). Default 1080p cadence is set to **50 FPS** so it runs indefinitely without queue buildup at stock clocks; 60 FPS at 1080p will be tested with VPU clock tuning (`h264_freq=333`, `core_freq=450`) in Phase 3.

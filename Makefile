@@ -33,8 +33,8 @@ CLIENT_OBJS := $(patsubst client/%.c,$(BUILD_DIR)/client/%.o,$(CLIENT_SRCS))
 
 SERVER_CFLAGS = $(shell $(PKG_CFG) --cflags $(SERVER_PKGS))
 SERVER_LIBS   = $(shell $(PKG_CFG) --libs $(SERVER_PKGS))
-CLIENT_CFLAGS = $(shell $(PKG_CFG) --cflags $(CLIENT_PKGS))
-CLIENT_LIBS   = $(shell $(PKG_CFG) --libs $(CLIENT_PKGS))
+CLIENT_CFLAGS = $(shell $(PKG_CFG) --cflags $(CLIENT_PKGS)) -pthread
+CLIENT_LIBS   = $(shell $(PKG_CFG) --libs $(CLIENT_PKGS)) -lpthread
 
 all: $(DEFAULT_TARGET)
 

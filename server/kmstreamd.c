@@ -50,6 +50,14 @@ static inline uint16_t clamp_u16(uint64_t v) {
     return (v > 65535ULL) ? 65535U : (uint16_t)v;
 }
 
+static inline void ts_add_ns(struct timespec *ts, long ns) {
+    ts->tv_nsec += ns;
+    while (ts->tv_nsec >= 1000000000L) {
+        ts->tv_sec++;
+        ts->tv_nsec -= 1000000000L;
+    }
+}
+
 static const char *vs_src =
     "attribute vec2 pos;\n"
     "attribute vec2 in_uv;\n"
@@ -125,8 +133,9 @@ static void get_plane_atomic_info(int drm_fd, uint32_t plane_id, uint64_t *type,
     drmModeFreeObjectProperties(props);
 }
 
-/* Drains incoming back-channel messages (PING -> PONG immediately, STATS -> cached). */
-static void drain_ctrl_sock(int ctrl_sock, struct kms_ctrl_stats *last_pi_stats, int *has_pi_stats) {
+/* Drains incoming back-channel messages (PING -> PONG, STATS -> cached, IDR_REQUEST -> force_idr). */
+static void drain_ctrl_sock(int ctrl_sock, struct kms_ctrl_stats *last_pi_stats,
+                            int *has_pi_stats, int *force_idr, uint32_t *idr_reqs_total) {
     uint8_t buf[128];
     struct sockaddr_in peer;
     socklen_t peer_len = sizeof(peer);
@@ -159,15 +168,19 @@ static void drain_ctrl_sock(int ctrl_sock, struct kms_ctrl_stats *last_pi_stats,
         } else if (h->type == KMS_CTRL_STATS && n >= (ssize_t)sizeof(struct kms_ctrl_stats)) {
             memcpy(last_pi_stats, buf, sizeof(*last_pi_stats));
             *has_pi_stats = 1;
+        } else if (h->type == KMS_CTRL_IDR_REQUEST && n >= (ssize_t)sizeof(struct kms_ctrl_idr_request)) {
+            *force_idr = 1;
+            (*idr_reqs_total)++;
         }
     }
 }
 
-/* Sleeps until deadline_us while waking immediately on any incoming control packet (PING). */
+/* Sleeps until deadline_us while waking immediately on any incoming control packet (PING/IDR). */
 static void wait_until_or_ctrl(int ctrl_sock, uint64_t deadline_us,
-                               struct kms_ctrl_stats *last_pi_stats, int *has_pi_stats) {
+                               struct kms_ctrl_stats *last_pi_stats, int *has_pi_stats,
+                               int *force_idr, uint32_t *idr_reqs_total) {
     while (1) {
-        drain_ctrl_sock(ctrl_sock, last_pi_stats, has_pi_stats);
+        drain_ctrl_sock(ctrl_sock, last_pi_stats, has_pi_stats, force_idr, idr_reqs_total);
         uint64_t now = now_us();
         if (now >= deadline_us) break;
         uint64_t rem_us = deadline_us - now;
@@ -181,23 +194,31 @@ static void wait_until_or_ctrl(int ctrl_sock, uint64_t deadline_us,
 }
 
 static void usage(const char *prog) {
-    fprintf(stderr, "Usage: sudo %s [--dump <file.h264>] [--frames <N>] <PI_IP> [/dev/dri/card1] [1080|720]\n", prog);
+    fprintf(stderr,
+            "Usage: %s [--fps <FPS>] [--bitrate <Mbps>] [--dump <file.h264>] [--frames <N>] <PI_IP> [/dev/dri/card1] [1080|720]\n",
+            prog);
 }
 
 int main(int argc, char **argv) {
     const char *dump_path = NULL;
     uint32_t max_frames = 0;
+    int bitrate_mbps = 0;
+    int target_fps = 0;
 
     static const struct option long_opts[] = {
-        { "dump",   required_argument, NULL, 'd' },
-        { "frames", required_argument, NULL, 'n' },
-        { "help",   no_argument,       NULL, 'h' },
+        { "fps",     required_argument, NULL, 'f' },
+        { "bitrate", required_argument, NULL, 'b' },
+        { "dump",    required_argument, NULL, 'd' },
+        { "frames",  required_argument, NULL, 'n' },
+        { "help",    no_argument,       NULL, 'h' },
         { NULL, 0, NULL, 0 }
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "d:n:h", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "f:b:d:n:h", long_opts, NULL)) != -1) {
         switch (opt) {
+        case 'f': target_fps = atoi(optarg); break;
+        case 'b': bitrate_mbps = atoi(optarg); break;
         case 'd': dump_path = optarg; break;
         case 'n': max_frames = (uint32_t)strtoul(optarg, NULL, 10); break;
         case 'h':
@@ -215,6 +236,8 @@ int main(int argc, char **argv) {
     const char *pi_ip = argv[optind];
     const char *card = (argc - optind > 1) ? argv[optind + 1] : "/dev/dri/card1";
     int use_720p = (argc - optind > 2 && atoi(argv[optind + 2]) == 720) ? 1 : 0;
+    if (target_fps <= 0) target_fps = use_720p ? 60 : 50;
+    uint64_t frame_interval_us = 1000000ULL / (uint64_t)target_fps;
 
     FILE *dump_fp = NULL;
     if (dump_path) {
@@ -224,7 +247,7 @@ int main(int argc, char **argv) {
 
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
     DIE_IF(sock < 0, "socket: %s", strerror(errno));
-    int sndbuf = 512 * 1024;
+    int sndbuf = 2 * 1024 * 1024;
     int tos = IPTOS_LOWDELAY;
     setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
     setsockopt(sock, IPPROTO_IP, IP_TOS, &tos, sizeof(tos));
@@ -381,16 +404,23 @@ int main(int argc, char **argv) {
     AVCodecContext *enc = avcodec_alloc_context3(codec);
     DIE_IF(!enc, "avcodec_alloc_context3 failed");
     enc->width = enc_w; enc->height = enc_h;
-    enc->time_base = (AVRational){1, 60};
-    enc->framerate = (AVRational){60, 1};
+    enc->time_base = (AVRational){1, target_fps};
+    enc->framerate = (AVRational){target_fps, 1};
     enc->pix_fmt = AV_PIX_FMT_VAAPI;
     enc->max_b_frames = 0;
-    enc->gop_size = 120;
-    enc->global_quality = 24;
+    enc->gop_size = 600; /* Long GOP + on-demand IDR via back-channel */
     enc->refs = 1;
     enc->flags |= AV_CODEC_FLAG_LOW_DELAY;
     enc->hw_frames_ctx = av_buffer_ref(hw_frames_ref);
-    av_opt_set(enc->priv_data, "rc_mode", "CQP", 0);
+    if (bitrate_mbps > 0) {
+        enc->bit_rate = (int64_t)bitrate_mbps * 1000000LL;
+        enc->rc_max_rate = (int64_t)(bitrate_mbps + 4) * 1000000LL;
+        enc->rc_buffer_size = (int)(enc->bit_rate / 45);
+        av_opt_set(enc->priv_data, "rc_mode", "VBR", 0);
+    } else {
+        enc->global_quality = use_720p ? 24 : 26;
+        av_opt_set(enc->priv_data, "rc_mode", "CQP", 0);
+    }
     av_opt_set(enc->priv_data, "profile", "constrained_baseline", 0);
     av_opt_set_int(enc->priv_data, "idr_interval", 1, 0);
     DIE_IF(avcodec_open2(enc, codec, NULL) < 0, "avcodec_open2(h264_vaapi) failed");
@@ -400,8 +430,10 @@ int main(int argc, char **argv) {
     DIE_IF(!pkt || !patched_buf, "allocation failed");
     float fullscreen_quad[] = { -1,-1,0,0,  1,-1,1,0,  -1,1,0,1,  1,1,1,1 };
 
-    printf("=== KMStream Server (proto v%d, SPS Zero-Latency Patch) (%dx%d -> %dx%d) | Primary: %u | Cursor: %u ===\n",
-           KMS_PROTO_VERSION, src_w, src_h, enc_w, enc_h, primary_plane_id, cursor_plane_id);
+    printf("=== KMStream Server (proto v%d, %s + Pacing) (%dx%d -> %dx%d) | Primary: %u | Cursor: %u ===\n",
+           KMS_PROTO_VERSION,
+           bitrate_mbps > 0 ? "VBR" : (use_720p ? "CQP24" : "CQP26"),
+           src_w, src_h, enc_w, enc_h, primary_plane_id, cursor_plane_id);
     fflush(stdout);
 
     uint32_t frame_id = 1;
@@ -410,6 +442,8 @@ int main(int argc, char **argv) {
     uint64_t next_frame_tick = now_us();
     uint64_t stat_timer = next_frame_tick;
     int sps_logged = 0;
+    int force_idr = 0;
+    uint32_t idr_reqs_total = 0;
 
     struct kms_stat_win st_conv = {0}, st_enc = {0}, st_tx = {0}, st_sz = {0};
     uint32_t tx_errors = 0;
@@ -417,9 +451,10 @@ int main(int argc, char **argv) {
     int has_pi_stats = 0;
 
     while (!max_frames || frame_id <= max_frames) {
-        wait_until_or_ctrl(ctrl_sock, next_frame_tick, &last_pi_stats, &has_pi_stats);
+        wait_until_or_ctrl(ctrl_sock, next_frame_tick, &last_pi_stats, &has_pi_stats,
+                           &force_idr, &idr_reqs_total);
         uint64_t now = now_us();
-        next_frame_tick += 16666;
+        next_frame_tick += frame_interval_us;
         if (now > next_frame_tick + 30000) next_frame_tick = now;
 
         uint64_t t_cap0 = now;
@@ -522,8 +557,20 @@ int main(int argc, char **argv) {
         uint64_t t_conv_end = now_us();
         uint64_t conv_us = t_conv_end - t_cap0;
 
+        drain_ctrl_sock(ctrl_sock, &last_pi_stats, &has_pi_stats, &force_idr, &idr_reqs_total);
+
         va_frame->pts = frame_id;
+        if (force_idr) {
+            va_frame->pict_type = AV_PICTURE_TYPE_I;
+            va_frame->flags |= AV_FRAME_FLAG_KEY;
+        }
         avcodec_send_frame(enc, va_frame);
+        if (force_idr) {
+            va_frame->pict_type = AV_PICTURE_TYPE_NONE;
+            va_frame->flags &= ~AV_FRAME_FLAG_KEY;
+            force_idr = 0;
+        }
+
         while (avcodec_receive_packet(enc, pkt) == 0) {
             const uint8_t *send_ptr = pkt->data;
             int send_size = pkt->size;
@@ -554,6 +601,11 @@ int main(int argc, char **argv) {
             }
 
             uint16_t total_chunks = (uint16_t)((send_size + KMS_CHUNK_SIZE - 1) / KMS_CHUNK_SIZE);
+            struct timespec pace_ts;
+            if (total_chunks > 6) {
+                clock_gettime(CLOCK_MONOTONIC, &pace_ts);
+            }
+
             for (uint16_t c = 0; c < total_chunks; c++) {
                 int offset = c * KMS_CHUNK_SIZE;
                 uint16_t len = (send_size - offset > KMS_CHUNK_SIZE) ? KMS_CHUNK_SIZE : (uint16_t)(send_size - offset);
@@ -570,9 +622,20 @@ int main(int argc, char **argv) {
                 hdr->t_convert_us  = clamp_u16(conv_us);
                 hdr->t_encode_us   = clamp_u16(enc_us);
                 memcpy(udp_pkt + sizeof(struct kms_video_hdr), send_ptr + offset, len);
-                if (sendto(sock, udp_pkt, sizeof(struct kms_video_hdr) + len, 0,
-                           (struct sockaddr *)&pi_addr, sizeof(pi_addr)) < 0) {
-                    tx_errors++;
+
+                ssize_t sret = sendto(sock, udp_pkt, sizeof(struct kms_video_hdr) + len, 0,
+                                      (struct sockaddr *)&pi_addr, sizeof(pi_addr));
+                if (sret < 0 && (errno == ENOBUFS || errno == EAGAIN)) {
+                    usleep(100);
+                    sret = sendto(sock, udp_pkt, sizeof(struct kms_video_hdr) + len, 0,
+                                  (struct sockaddr *)&pi_addr, sizeof(pi_addr));
+                }
+                if (sret < 0) tx_errors++;
+
+                /* Pace bursts > 6 chunks at ~80 Mbps (4 chunks = ~5.7 KB every 560 us) */
+                if (total_chunks > 6 && ((c + 1) & 3) == 0 && (c + 1) < total_chunks) {
+                    ts_add_ns(&pace_ts, 560000L);
+                    clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &pace_ts, NULL);
                 }
             }
             uint64_t t_tx_end = now_us();
@@ -587,7 +650,7 @@ int main(int argc, char **argv) {
             av_packet_unref(pkt);
         }
 
-        drain_ctrl_sock(ctrl_sock, &last_pi_stats, &has_pi_stats);
+        drain_ctrl_sock(ctrl_sock, &last_pi_stats, &has_pi_stats, &force_idr, &idr_reqs_total);
 
         uint64_t t_log = now_us();
         if (t_log - stat_timer >= 2000000ULL && st_conv.count > 0) {
@@ -599,23 +662,23 @@ int main(int argc, char **argv) {
             kms_stat_compute(&st_sz,   &sz_avg,   &sz_p99);
 
             if (has_pi_stats) {
-                printf("[PC] %4.1f FPS | Size: %4.1f/%4.1f KB | Conv: %.2f/%.2f ms | Enc: %.2f/%.2f ms | TX: %.2f/%.2f ms (err:%u) | Pi E2E: %.2f/%.2f ms (inc:%u)\n",
+                printf("[PC] %4.1f FPS | Size: %4.1f/%4.1f KB | Conv: %.2f/%.2f ms | Enc: %.2f/%.2f ms | TX: %.2f/%.2f ms (err:%u idr_req:%u) | Pi E2E: %.2f/%.2f ms (inc:%u)\n",
                        fps,
                        sz_avg / 1024.0, sz_p99 / 1024.0,
                        conv_avg / 1000.0, conv_p99 / 1000.0,
                        enc_avg / 1000.0, enc_p99 / 1000.0,
                        tx_avg / 1000.0, tx_p99 / 1000.0,
-                       tx_errors,
+                       tx_errors, idr_reqs_total,
                        last_pi_stats.e2e_us_avg / 1000.0, last_pi_stats.e2e_us_p99 / 1000.0,
                        last_pi_stats.frames_lost);
             } else {
-                printf("[PC] %4.1f FPS | Size: %4.1f/%4.1f KB | Conv: %.2f/%.2f ms | Enc: %.2f/%.2f ms | TX: %.2f/%.2f ms (err:%u)\n",
+                printf("[PC] %4.1f FPS | Size: %4.1f/%4.1f KB | Conv: %.2f/%.2f ms | Enc: %.2f/%.2f ms | TX: %.2f/%.2f ms (err:%u idr_req:%u)\n",
                        fps,
                        sz_avg / 1024.0, sz_p99 / 1024.0,
                        conv_avg / 1000.0, conv_p99 / 1000.0,
                        enc_avg / 1000.0, enc_p99 / 1000.0,
                        tx_avg / 1000.0, tx_p99 / 1000.0,
-                       tx_errors);
+                       tx_errors, idr_reqs_total);
             }
             fflush(stdout);
             kms_stat_reset(&st_conv);

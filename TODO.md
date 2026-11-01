@@ -33,20 +33,20 @@ Workflow per phase: plan → subagent review → approval → implement → test
 - [x] Baseline numbers recorded for 720p (1080p after Phase 2)
 
 ## Phase 2 — Network & pipeline robustness (expected to fix 1080p)
-- [ ] Client: dedicated high-priority RX thread + preallocated frame ring (decoupled from decode/display)
-- [ ] Client: chunk bitmap (ignore duplicates, detect loss incl. last chunk)
-- [ ] Client: `SO_RCVBUF` 2–4 MB, verified with `getsockopt`
-- [ ] Client: decode wait deadline adapted to resolution (1080p decode may exceed 4.5 ms)
-- [ ] Client: keep displayed `AVFrame` referenced until next flip; fix GEM handle lifetime
-- [ ] Client: `num_capture_buffers` ≥ 4–5 (KMS holds buffers)
-- [ ] Buffer limits: server `patched_buf` and client `MAX_CHUNKS` ≥ 2 MB or explicit overflow handling
-- [ ] Server: packet pacing computed from target rate (`chunk_bits / rate`, ~120 µs @ 85 Mbps)
-- [ ] Server: handle `sendto` errors (`ENOBUFS`), evaluate qdisc/`SO_PRIORITY` on the link
-- [ ] Encoder rate control: CBR / capped VBR (`b≈25M`, `maxrate≈30M`, `bufsize≈1 frame`), configurable
-- [ ] Back-channel: client requests IDR on loss; server forces IDR
-- [ ] Infinite GOP (IDR only on demand) once recovery works
-- [ ] Evaluate multi-slice encoding (`slices=4`); intra-refresh is low priority (weak support on VCE 3.4)
-- [ ] Validate: 1080p stable, `netstat -su` receive buffer errors not increasing; record 1080p baseline
+- [x] Client: dedicated high-priority RX thread + preallocated frame ring (decoupled from decode/display)
+- [x] Client: chunk bitmap (ignore duplicates, detect loss incl. last chunk)
+- [x] Client: `SO_RCVBUF` 2–4 MB, verified with `getsockopt`
+- [x] Client: decode wait deadline adapted to resolution (1080p decode may exceed 4.5 ms)
+- [x] Client: keep displayed `AVFrame` referenced until next flip; fix GEM handle lifetime
+- [x] Client: `num_capture_buffers` ≥ 4–5 (KMS holds buffers)
+- [x] Buffer limits: server `patched_buf` and client `MAX_CHUNKS` ≥ 2 MB or explicit overflow handling
+- [x] Server: packet pacing computed from target rate (`chunk_bits / rate`, ~120 µs @ 85 Mbps)
+- [x] Server: handle `sendto` errors (`ENOBUFS`), evaluate qdisc/`SO_PRIORITY` on the link
+- [x] Encoder rate control: CBR / capped VBR (`b≈25M`, `maxrate≈30M`, `bufsize≈1 frame`), configurable
+- [x] Back-channel: client requests IDR on loss; server forces IDR
+- [x] Infinite GOP (IDR only on demand) once recovery works
+- [x] Evaluate multi-slice encoding (`slices=4`); intra-refresh is low priority (weak support on VCE 3.4)
+- [x] Validate: 1080p stable, `netstat -su` receive buffer errors not increasing; record 1080p baseline
 
 ## Phase 3 — Fine latency tuning
 - [ ] Full module split (server: capture/convert/encode/net; client: net/decode/display)
