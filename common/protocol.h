@@ -9,17 +9,22 @@ _Static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__, "little-endian require
 #define KMSTREAM_STATS 0
 #endif
 
-#define KMS_PROTO_VERSION (1 + (KMSTREAM_STATS ? 128 : 0))
+#define KMS_PROTO_VERSION (3 + (KMSTREAM_STATS ? 128 : 0))
 #define KMS_VIDEO_PORT    5000   /* PC -> Pi */
-#define KMS_CTRL_PORT     5001   /* Pi -> PC (back-channel) */
+#define KMS_CTRL_PORT     5001   /* Pi <-> PC (session & back-channel) */
 #define KMS_CHUNK_SIZE    1400   /* header (16 or 32) + payload (1400) < 1472 (MTU 1500) */
 #define KMS_MAX_FRAME     (2 * 1024 * 1024)
 #define KMS_MAX_CHUNKS    ((KMS_MAX_FRAME + KMS_CHUNK_SIZE - 1) / KMS_CHUNK_SIZE)
 
 enum {
-    KMS_FLAG_IDR          = 1 << 0,
-    KMS_FLAG_SPS_PATCHED  = 1 << 1,
-    KMS_FLAG_STREAM_RESET = 1 << 2,
+    KMS_FLAG_IDR         = 1 << 0,
+    KMS_FLAG_SPS_PATCHED = 1 << 1,
+};
+
+enum kms_rc_mode {
+    KMS_RC_CBR = 0,
+    KMS_RC_VBR = 1,
+    KMS_RC_CQP = 2,
 };
 
 struct __attribute__((packed)) kms_video_hdr {
@@ -48,6 +53,9 @@ enum kms_ctrl_type {
     KMS_CTRL_PONG        = 3,
     KMS_CTRL_STATS       = 4,
     KMS_CTRL_NACK        = 5,
+    KMS_CTRL_START       = 6,
+    KMS_CTRL_STOP        = 7,
+    KMS_CTRL_KEEPALIVE   = 8,
 };
 
 struct __attribute__((packed)) kms_ctrl_hdr {
@@ -57,6 +65,19 @@ struct __attribute__((packed)) kms_ctrl_hdr {
     uint32_t seq;
 };
 _Static_assert(sizeof(struct kms_ctrl_hdr) == 8, "kms_ctrl_hdr must be 8 bytes");
+
+struct __attribute__((packed)) kms_ctrl_start {
+    struct kms_ctrl_hdr h;
+    uint16_t width;
+    uint16_t height;
+    uint16_t fps;
+    uint16_t bitrate_mbps;
+    uint8_t  rc_mode;            /* enum kms_rc_mode (CBR, VBR, CQP) */
+    uint8_t  strict_rc;          /* 0 = standard driver VBV (Sunshine default), 1 = 1-frame VBV */
+    uint8_t  cqp;                /* QP value when rc_mode == KMS_RC_CQP (default 22) */
+    uint8_t  reserved_pad;
+};
+_Static_assert(sizeof(struct kms_ctrl_start) == 20, "kms_ctrl_start size mismatch");
 
 struct __attribute__((packed)) kms_ctrl_idr_request {
     struct kms_ctrl_hdr h;
@@ -98,8 +119,10 @@ struct __attribute__((packed)) kms_ctrl_stats {
     uint16_t decode_us_p99;
     uint16_t display_us_avg;
     uint16_t display_us_p99;
+    uint16_t mbox_skips;
+    uint16_t idr_reqs;
 };
-_Static_assert(sizeof(struct kms_ctrl_stats) == 36, "kms_ctrl_stats size mismatch");
+_Static_assert(sizeof(struct kms_ctrl_stats) == 40, "kms_ctrl_stats size mismatch");
 #endif /* KMSTREAM_STATS */
 
 #endif /* KMSTREAM_PROTOCOL_H */

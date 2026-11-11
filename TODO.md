@@ -69,6 +69,20 @@ Workflow per phase: plan → subagent review → approval → implement → test
 - [x] Automatic KMS plane disable after ~2s idle timeout on Pi, plus seamless decoder re-init on server restart / resolution switch (`720p <-> 1080p`)
 - [x] Validate Release and `stats=1` builds on PC and Pi hardware
 
+## Phase 5 — Direct V4L2 M2M (Zero FFmpeg on Pi), DRM Page-Flip Mailbox & Client-Driven Session Control
+- [x] Protocol & CLI inversion: client (`kmstream-pi <SERVER_IP> [-720|-1080] [-fps N] [-bitrate M]`) initiates and configures session via `KMS_CTRL_START` / `KMS_CTRL_STOP` / `KMS_CTRL_KEEPALIVE`; `kmstreamd` runs idle at 0% CPU/GPU until requested
+- [x] Server lifecycle cleanup (`vaapi_enc_cleanup`, `egl_convert_cleanup`) for leak-free client connect/disconnect/reconfigure cycles
+- [x] Client: remove `libavcodec`/`libavutil` dependency (`CLIENT_PKGS := libdrm`); implement direct `/dev/video10` (`bcm2835-codec-decode`) V4L2 M2M (`NV12`, DRC `V4L2_EVENT_SOURCE_CHANGE`)
+- [x] Client: `SCHED_FIFO` (priority 45) event thread (`poll` on `v4l2_fd` and `drm_fd`) + non-blocking `DRM_MODE_PAGE_FLIP_EVENT` mailbox (`staged_frame_idx`) on Primary Plane (`NV12`, restoring `fbcon` on exit)
+- [ ] Phase 5.1 — Sunshine/Moonlight Parity, 100Hz->60FPS Pacing Fix, VA-API Rate Control & Rich Telemetry/Logs:
+  - [x] Rich startup & session hardware/display logs on both Server and Client (DRM driver, connector, active resolution & exact refresh rate in Hz, plane IDs, formats/modifiers, VAAPI vendor/profile/RC/VBV, V4L2 geometry & buffers)
+  - [x] Fix 100 Hz monitor vs 60 FPS server pacing bug: replace `net_tx_wait_vblank` with monotonic `net_tx_pace_frame` (`ppoll` on `ctrl_sock` up to `deadline_us`)
+  - [x] Sunshine-matched VAAPI & EGL quality/latency: `AMD_DEBUG=lowlatencyenc`, `VAProfileH264High` (`profile=high`), `compression_level=32 (speed)`, `slices=1`, `async_depth=1`, `sei=0`, BT.709 colorimetry, 2-tap horizontal chroma filter in `convert_egl.c`
+  - [x] Configurable VA-API Rate Control from client CLI (`-rc cbr|vbr|cqp`, `-qp N`, `-strict-rc`), defaulting to CBR with standard driver VBV
+  - [x] Fix `1080p60` stall on Pi: 4 `OUTPUT_MPLANE` buffers, 200 ms IDR request cooldown, never block P-frames (`waiting_for_idr`) after first IDR
+  - [x] Full telemetry in `stats=1` (server `FPS`, `dt avg/p99`, `Bitrate Mbps`, `Frame KB`, `Cap/Conv/Enc/TX`; client `RX FPS`, `Flip FPS`, `V4L2 Dec avg/p99`, `KMS FlipWait avg/p99`, `E2E avg/p99`, `MboxSkip`, `RxDrop`, `Loss`, `IDR reqs`)
+  - [ ] Validate on hardware (`720p60` and `1080p60`, `stats=1` and Release) against Sunshine + `moonlight-embedded-rpi3-v4l2`
+
 ## Later (out of current scope)
 - [ ] Input (keyboard/mouse/gamepad) back-channel
 - [ ] Audio (low-latency Opus or raw PCM)

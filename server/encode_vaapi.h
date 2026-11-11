@@ -16,15 +16,18 @@ struct vaapi_enc_ctx {
     AVPacket       *pkt;
     uint8_t        *patched_buf;
     int             sps_logged;
+    int             initialized;
 };
 
 void vaapi_enc_init(struct vaapi_enc_ctx *ctx, int enc_w, int enc_h,
                     int target_fps, int bitrate_mbps,
+                    uint8_t rc_mode, uint8_t strict_rc, uint8_t cqp_val,
                     VADRMPRIMESurfaceDescriptor *prime_out);
 void vaapi_enc_close_prime(VADRMPRIMESurfaceDescriptor *prime);
 int  vaapi_enc_submit(struct vaapi_enc_ctx *ctx, uint32_t frame_id, int force_idr);
 int  vaapi_enc_receive(struct vaapi_enc_ctx *ctx, const uint8_t **data_out,
                        int *size_out, uint8_t *flags_out);
 void vaapi_enc_unref_pkt(struct vaapi_enc_ctx *ctx);
+void vaapi_enc_cleanup(struct vaapi_enc_ctx *ctx);
 
 #endif /* KMSTREAM_ENCODE_VAAPI_H */

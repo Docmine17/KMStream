@@ -17,12 +17,49 @@
     } \
 } while (0)
 
-static const volatile sig_atomic_t *g_rx_stop_flag = NULL;
+#define SERVER_CONNECT_TIMEOUT_US 5000000ULL /* 5.0s waiting for initial frame */
+#define SERVER_STREAM_TIMEOUT_US  2500000ULL /* 2.5s without packets during stream */
+
+static volatile sig_atomic_t *g_rx_stop_flag = NULL;
 
 static inline uint64_t now_us(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
     return (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
+}
+
+static void send_start_packet_locked(struct rx_shared *sh, uint64_t now) {
+    sh->last_keepalive_us = now;
+    struct kms_ctrl_start pkt = {
+        .h = {
+            .version  = KMS_PROTO_VERSION,
+            .type     = KMS_CTRL_START,
+            .reserved = 0,
+            .seq      = ++sh->ctrl_seq,
+        },
+        .width        = sh->req_width,
+        .height       = sh->req_height,
+        .fps          = sh->req_fps,
+        .bitrate_mbps = sh->req_bitrate_mbps,
+        .rc_mode      = sh->req_rc_mode,
+        .strict_rc    = sh->req_strict_rc,
+        .cqp          = sh->req_cqp,
+        .reserved_pad = 0,
+    };
+    sendto(sh->ctrl_sock, &pkt, sizeof(pkt), MSG_DONTWAIT,
+           (const struct sockaddr *)&sh->srv_ctrl_addr, sizeof(sh->srv_ctrl_addr));
+}
+
+static void send_keepalive_locked(struct rx_shared *sh, uint64_t now) {
+    sh->last_keepalive_us = now;
+    struct kms_ctrl_hdr pkt = {
+        .version  = KMS_PROTO_VERSION,
+        .type     = KMS_CTRL_KEEPALIVE,
+        .reserved = 0,
+        .seq      = ++sh->ctrl_seq,
+    };
+    sendto(sh->ctrl_sock, &pkt, sizeof(pkt), MSG_DONTWAIT,
+           (const struct sockaddr *)&sh->srv_ctrl_addr, sizeof(sh->srv_ctrl_addr));
 }
 
 #if KMSTREAM_STATS
@@ -53,23 +90,7 @@ static void clock_sync_on_pong(struct clock_sync *cs, const struct kms_ctrl_pong
     }
 }
 
-static void drain_ctrl_pongs_locked(struct rx_shared *sh) {
-    uint8_t buf[128];
-    while (1) {
-        ssize_t n = recv(sh->ctrl_sock, buf, sizeof(buf), MSG_DONTWAIT);
-        if (n < (ssize_t)sizeof(struct kms_ctrl_hdr)) break;
-        uint64_t t3 = now_us();
-        const struct kms_ctrl_hdr *h = (const struct kms_ctrl_hdr *)buf;
-        if (h->version == KMS_PROTO_VERSION && h->type == KMS_CTRL_PONG &&
-            n >= (ssize_t)sizeof(struct kms_ctrl_pong)) {
-            clock_sync_on_pong(&sh->cs, (const struct kms_ctrl_pong *)buf, t3);
-        }
-    }
-}
-
-static void maybe_send_ping_locked(struct rx_shared *sh) {
-    if (!sh->has_srv_addr) return;
-    uint64_t now = now_us();
+static void maybe_send_ping_locked(struct rx_shared *sh, uint64_t now) {
     uint64_t interval = (sh->cs.ring_count < 8) ? 50000ULL : 250000ULL;
     if (now - sh->cs.last_ping_us < interval) return;
     sh->cs.last_ping_us = now;
@@ -86,12 +107,43 @@ static void maybe_send_ping_locked(struct rx_shared *sh) {
     sendto(sh->ctrl_sock, &ping, sizeof(ping), MSG_DONTWAIT,
            (const struct sockaddr *)&sh->srv_ctrl_addr, sizeof(sh->srv_ctrl_addr));
 }
+
+void net_rx_send_stats(struct rx_shared *sh, const struct kms_ctrl_stats *st) {
+    pthread_mutex_lock(&sh->mtx);
+    sendto(sh->ctrl_sock, st, sizeof(*st), MSG_DONTWAIT,
+           (const struct sockaddr *)&sh->srv_ctrl_addr, sizeof(sh->srv_ctrl_addr));
+    pthread_mutex_unlock(&sh->mtx);
+}
 #endif /* KMSTREAM_STATS */
+
+static void drain_ctrl_rx_locked(struct rx_shared *sh) {
+    uint8_t buf[128];
+    while (1) {
+        ssize_t n = recv(sh->ctrl_sock, buf, sizeof(buf), MSG_DONTWAIT);
+        if (n < (ssize_t)sizeof(struct kms_ctrl_hdr)) break;
+#if KMSTREAM_STATS
+        uint64_t t3 = now_us();
+#endif
+        const struct kms_ctrl_hdr *h = (const struct kms_ctrl_hdr *)buf;
+        if (h->version != KMS_PROTO_VERSION) continue;
+
+        if (h->type == KMS_CTRL_STOP) {
+            sh->server_stopped = 1;
+            if (g_rx_stop_flag) *g_rx_stop_flag = 1;
+            pthread_cond_broadcast(&sh->cond);
+        }
+#if KMSTREAM_STATS
+        else if (h->type == KMS_CTRL_PONG && n >= (ssize_t)sizeof(struct kms_ctrl_pong)) {
+            clock_sync_on_pong(&sh->cs, (const struct kms_ctrl_pong *)buf, t3);
+        }
+#endif
+    }
+}
 
 static void send_idr_request_locked(struct rx_shared *sh, uint64_t now) {
     sh->waiting_for_idr = 1;
-    if (!sh->has_srv_addr) return;
-    if (now - sh->last_idr_req_us < 25000ULL) return;
+    uint64_t cooldown_us = sh->first_idr_received ? 200000ULL : 25000ULL;
+    if (sh->last_idr_req_us > 0 && (now - sh->last_idr_req_us < cooldown_us)) return;
     sh->last_idr_req_us = now;
     sh->idr_requests_sent++;
 
@@ -100,7 +152,7 @@ static void send_idr_request_locked(struct rx_shared *sh, uint64_t now) {
             .version  = KMS_PROTO_VERSION,
             .type     = KMS_CTRL_IDR_REQUEST,
             .reserved = 0,
-            .seq      = ++sh->idr_req_seq,
+            .seq      = ++sh->ctrl_seq,
         },
         .last_good_frame = sh->last_completed_id,
     };
@@ -109,7 +161,7 @@ static void send_idr_request_locked(struct rx_shared *sh, uint64_t now) {
 }
 
 void net_rx_request_idr_locked(struct rx_shared *sh) {
-    sh->last_idr_req_us = 0; /* force immediate send */
+    /* Respect the 200 ms IDR cooldown so transient queue fullness in 1080p60 never triggers an IDR storm */
     send_idr_request_locked(sh, now_us());
 }
 
@@ -151,14 +203,47 @@ static void *rx_thread_fn(void *arg) {
         poll(pfds, 2, 20);
         if (g_rx_stop_flag && *g_rx_stop_flag) break;
 
+        uint64_t now = now_us();
         pthread_mutex_lock(&sh->mtx);
+        drain_ctrl_rx_locked(sh);
+        if (g_rx_stop_flag && *g_rx_stop_flag) {
+            pthread_mutex_unlock(&sh->mtx);
+            break;
+        }
+
+        if (sh->last_rx_us == 0) {
+            /* Waiting for server to start streaming: retransmit KMS_CTRL_START every 200ms */
+            if (now - sh->start_sent_us > SERVER_CONNECT_TIMEOUT_US) {
+                fprintf(stderr, "[kmstream-pi] Connection timed out (no response from server).\n");
+                sh->server_stopped = 1;
+                if (g_rx_stop_flag) *g_rx_stop_flag = 1;
+                pthread_cond_broadcast(&sh->cond);
+                pthread_mutex_unlock(&sh->mtx);
+                break;
+            }
+            if (now - sh->last_keepalive_us >= 200000ULL) {
+                send_start_packet_locked(sh, now);
+            }
+        } else {
+            /* Stream active: check for 2.5s server silence and send 500ms keepalives */
+            if (now - sh->last_rx_us > SERVER_STREAM_TIMEOUT_US) {
+                printf("[kmstream-pi] Server stream stopped.\n");
+                fflush(stdout);
+                sh->server_stopped = 1;
+                if (g_rx_stop_flag) *g_rx_stop_flag = 1;
+                pthread_cond_broadcast(&sh->cond);
+                pthread_mutex_unlock(&sh->mtx);
+                break;
+            }
+            if (now - sh->last_keepalive_us >= 500000ULL) {
+                send_keepalive_locked(sh, now);
+            }
+            if (sh->waiting_for_idr) {
+                send_idr_request_locked(sh, now);
+            }
 #if KMSTREAM_STATS
-        drain_ctrl_pongs_locked(sh);
-        maybe_send_ping_locked(sh);
+            maybe_send_ping_locked(sh, now);
 #endif
-        if (sh->waiting_for_idr && sh->last_rx_us > 0 &&
-            (now_us() - sh->last_rx_us) < 1000000ULL) {
-            send_idr_request_locked(sh, now_us());
         }
         pthread_mutex_unlock(&sh->mtx);
 
@@ -174,7 +259,7 @@ static void *rx_thread_fn(void *arg) {
             if (hdr->version != KMS_PROTO_VERSION) {
                 if (!version_mismatch_logged) {
                     fprintf(stderr,
-                            "[NET] Protocol version mismatch: got v%u, expected v%u (ensure both PC and Pi are compiled with same stats=0/1 mode)\n",
+                            "[kmstream-pi] Protocol version mismatch: got v%u, expected v%u (ensure both PC and Pi use same stats=0/1 build)\n",
                             hdr->version, KMS_PROTO_VERSION);
                     version_mismatch_logged = 1;
                 }
@@ -188,41 +273,8 @@ static void *rx_thread_fn(void *arg) {
 
             pthread_mutex_lock(&sh->mtx);
             sh->last_rx_us = t_pkt;
-            if (!sh->has_srv_addr || sh->srv_ctrl_addr.sin_addr.s_addr != peer.sin_addr.s_addr) {
-                sh->srv_ctrl_addr = peer;
-                sh->srv_ctrl_addr.sin_port = htons(KMS_CTRL_PORT);
-                sh->has_srv_addr = 1;
-#if KMSTREAM_STATS
-                maybe_send_ping_locked(sh);
-#endif
-            }
 
-            /*
-             * Detect new server session (cur_frame_id > 5 and server restarted at frame_id <= 5).
-             * Only trigger stream_reset_pending once per restart (when cur_frame_id > 5),
-             * and signal the main thread ONLY when the new IDR frame is fully assembled
-             * (or immediately if frame 1 was missed so main thread can request IDR).
-             */
-            if ((cur_frame_id > 1 && hdr->frame_id == 1 && (hdr->flags & KMS_FLAG_IDR)) ||
-                (cur_frame_id > 15 && hdr->frame_id <= 5 &&
-                 ((hdr->flags & KMS_FLAG_STREAM_RESET) || (hdr->flags & KMS_FLAG_IDR)))) {
-                cur_frame_id = 0;
-                sh->last_completed_id = 0;
-                sh->waiting_for_idr = 1;
-                sh->stream_reset_pending = 1;
-                for (int i = 0; i < RX_RING_SLOTS; i++) {
-                    if (sh->slots[i].state != SLOT_SENDING) {
-                        sh->slots[i].state = SLOT_FREE;
-                    }
-                }
-                cur_slot_idx = -1;
-                if (!(hdr->flags & KMS_FLAG_IDR)) {
-                    net_rx_request_idr_locked(sh);
-                    pthread_cond_signal(&sh->cond);
-                }
-            }
-
-            if (hdr->frame_id < cur_frame_id && (cur_frame_id - hdr->frame_id) < 10000) {
+            if (hdr->frame_id < cur_frame_id) {
                 pthread_mutex_unlock(&sh->mtx);
                 continue;
             }
@@ -236,14 +288,15 @@ static void *rx_thread_fn(void *arg) {
                            !(hdr->flags & KMS_FLAG_IDR)) {
                     sh->frames_incomplete += (hdr->frame_id - sh->last_completed_id - 1);
                     send_idr_request_locked(sh, t_pkt);
-                } else if (sh->last_completed_id == 0 && !(hdr->flags & KMS_FLAG_IDR)) {
+                } else if (!sh->first_idr_received && !(hdr->flags & KMS_FLAG_IDR)) {
                     send_idr_request_locked(sh, t_pkt);
                 }
 
                 cur_frame_id = hdr->frame_id;
                 cur_slot_idx = -1;
 
-                if (sh->waiting_for_idr && !(hdr->flags & KMS_FLAG_IDR)) {
+                /* Only gate P-frames before the very first IDR of the session has been received */
+                if (!sh->first_idr_received && !(hdr->flags & KMS_FLAG_IDR)) {
                     pthread_mutex_unlock(&sh->mtx);
                     continue;
                 }
@@ -263,7 +316,13 @@ static void *rx_thread_fn(void *arg) {
                             oldest_idx = i;
                         }
                     }
-                    cur_slot_idx = (oldest_idx >= 0) ? oldest_idx : 0;
+                    if (oldest_idx >= 0) {
+                        cur_slot_idx = oldest_idx;
+                        sh->rx_drops++;
+                        send_idr_request_locked(sh, t_pkt);
+                    } else {
+                        cur_slot_idx = 0;
+                    }
                 }
 
                 reset_slot(&sh->slots[cur_slot_idx], hdr, t_pkt);
@@ -290,8 +349,10 @@ static void *rx_thread_fn(void *arg) {
 #endif
                         s->state = SLOT_READY;
                         sh->last_completed_id = s->frame_id;
+                        sh->frames_completed++;
                         if (s->flags & KMS_FLAG_IDR) {
-                            sh->waiting_for_idr = 0;
+                            sh->first_idr_received = 1;
+                            sh->waiting_for_idr    = 0;
                         }
                         cur_slot_idx = -1;
                         pthread_cond_signal(&sh->cond);
@@ -304,7 +365,11 @@ static void *rx_thread_fn(void *arg) {
     return NULL;
 }
 
-struct rx_shared *net_rx_init_and_start(const volatile sig_atomic_t *stop_flag) {
+struct rx_shared *net_rx_init_and_start(const char *server_ip,
+                                        uint16_t width, uint16_t height,
+                                        uint16_t fps, uint16_t bitrate_mbps,
+                                        uint8_t rc_mode, uint8_t strict_rc, uint8_t cqp,
+                                        volatile sig_atomic_t *stop_flag) {
     g_rx_stop_flag = stop_flag;
 
     int sock = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
@@ -330,47 +395,80 @@ struct rx_shared *net_rx_init_and_start(const volatile sig_atomic_t *stop_flag) 
     DIE_IF(!sh, "calloc rx_shared failed");
     pthread_mutex_init(&sh->mtx, NULL);
     pthread_cond_init(&sh->cond, NULL);
-    sh->video_sock      = sock;
-    sh->ctrl_sock       = ctrl_sock;
-    sh->actual_rcvbuf   = actual_rcvbuf;
-    sh->waiting_for_idr = 1;
+    sh->video_sock       = sock;
+    sh->ctrl_sock        = ctrl_sock;
+    sh->actual_rcvbuf    = actual_rcvbuf;
+    sh->req_width        = width;
+    sh->req_height       = height;
+    sh->req_fps          = fps;
+    sh->req_bitrate_mbps = bitrate_mbps;
+    sh->req_rc_mode      = rc_mode;
+    sh->req_strict_rc    = strict_rc;
+    sh->req_cqp          = cqp;
+    sh->waiting_for_idr  = 0;
 
-    pthread_t rx_tid;
-    DIE_IF(pthread_create(&rx_tid, NULL, rx_thread_fn, sh) != 0, "pthread_create failed");
-    pthread_detach(rx_tid);
+    sh->srv_ctrl_addr.sin_family = AF_INET;
+    sh->srv_ctrl_addr.sin_port   = htons(KMS_CTRL_PORT);
+    DIE_IF(inet_pton(AF_INET, server_ip, &sh->srv_ctrl_addr.sin_addr) != 1,
+           "invalid server IP '%s'", server_ip);
+
+    uint64_t now = now_us();
+    sh->start_sent_us   = now;
+    sh->last_idr_req_us = now;
+    send_start_packet_locked(sh, now);
+#if KMSTREAM_STATS
+    maybe_send_ping_locked(sh, now);
+#endif
+
+    DIE_IF(pthread_create(&sh->rx_tid, NULL, rx_thread_fn, sh) != 0, "pthread_create failed");
     return sh;
 }
 
 int net_rx_wait_for_ready(struct rx_shared *sh,
-                          const volatile sig_atomic_t *stop_flag,
-                          int is_blanked) {
+                          const volatile sig_atomic_t *stop_flag) {
     while (1) {
-        if (stop_flag && *stop_flag) {
+        if ((stop_flag && *stop_flag) || sh->server_stopped) {
             return -1;
         }
-        int has_ready = sh->stream_reset_pending;
         for (int i = 0; i < RX_RING_SLOTS; i++) {
             if (sh->slots[i].state == SLOT_READY) {
-                has_ready = 1;
-                break;
+                return 1;
             }
-        }
-        if (has_ready) {
-            return 1;
-        }
-        if (!is_blanked && sh->last_rx_us > 0 &&
-            (now_us() - sh->last_rx_us) >= 2000000ULL) {
-            return 0;
         }
 
         struct timespec wait_ts;
         clock_gettime(CLOCK_REALTIME, &wait_ts);
-        long sleep_ns = is_blanked ? 200000000L : 50000000L;
-        wait_ts.tv_nsec += sleep_ns;
+        wait_ts.tv_nsec += 50000000L; /* 50 ms */
         if (wait_ts.tv_nsec >= 1000000000L) {
             wait_ts.tv_sec++;
             wait_ts.tv_nsec -= 1000000000L;
         }
         pthread_cond_timedwait(&sh->cond, &sh->mtx, &wait_ts);
     }
+}
+
+void net_rx_cleanup(struct rx_shared *sh) {
+    if (!sh) return;
+    if (g_rx_stop_flag) *g_rx_stop_flag = 1;
+    pthread_cond_broadcast(&sh->cond);
+    pthread_join(sh->rx_tid, NULL);
+
+    if (!sh->server_stopped && sh->ctrl_sock >= 0) {
+        struct kms_ctrl_hdr stop_pkt = {
+            .version  = KMS_PROTO_VERSION,
+            .type     = KMS_CTRL_STOP,
+            .reserved = 0,
+            .seq      = ++sh->ctrl_seq,
+        };
+        for (int i = 0; i < 3; i++) {
+            sendto(sh->ctrl_sock, &stop_pkt, sizeof(stop_pkt), MSG_DONTWAIT,
+                   (const struct sockaddr *)&sh->srv_ctrl_addr, sizeof(sh->srv_ctrl_addr));
+        }
+    }
+
+    if (sh->video_sock >= 0) close(sh->video_sock);
+    if (sh->ctrl_sock >= 0)  close(sh->ctrl_sock);
+    pthread_cond_destroy(&sh->cond);
+    pthread_mutex_destroy(&sh->mtx);
+    free(sh);
 }

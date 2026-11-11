@@ -4,7 +4,7 @@ ARCH     := $(shell uname -m)
 stats    ?= 0
 
 ifeq ($(stats),1)
-  CFLAGS  ?= -O2 -pipe -flto
+  CFLAGS  ?= -O3 -pipe -flto
   CFLAGS  += -DKMSTREAM_STATS=1
   LDFLAGS ?= -flto
 else
@@ -31,7 +31,7 @@ SERVER_BIN := $(BUILD_DIR)/kmstreamd
 CLIENT_BIN := $(BUILD_DIR)/kmstream-pi
 
 SERVER_PKGS := libdrm gbm egl glesv2 libva libva-drm libavcodec libavutil
-CLIENT_PKGS := libdrm libavcodec libavutil
+CLIENT_PKGS := libdrm
 
 SERVER_SRCS := server/kmstreamd.c server/sps_patch.c server/capture_kms.c server/convert_egl.c server/encode_vaapi.c server/net_tx.c
 SERVER_OBJS := $(patsubst server/%.c,$(BUILD_DIR)/server/%.o,$(SERVER_SRCS))
@@ -79,8 +79,9 @@ debug: CFLAGS := -O0 -g3 -fsanitize=address,undefined -std=gnu11 -D_GNU_SOURCE -
 debug: LDFLAGS := -fsanitize=address,undefined
 debug: $(DEFAULT_TARGET)
 
-caps: $(SERVER_BIN)
-	sudo setcap cap_sys_admin+ep $(SERVER_BIN)
+caps:
+	@if [ ! -f $(SERVER_BIN) ]; then $(MAKE) $(SERVER_BIN); fi
+	pkexec setcap cap_sys_admin+ep $(SERVER_BIN)
 
 clean:
 	rm -rf $(BUILD_DIR)

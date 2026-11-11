@@ -13,6 +13,10 @@ struct kms_capture_ctx {
     int      active_crtc_idx;
     int      src_w;
     int      src_h;
+    double   src_hz;
+    uint32_t src_vrefresh;
+    char     conn_name[32];
+    char     driver_name[64];
     uint32_t handle_fail_cnt;
 };
 
@@ -24,10 +28,10 @@ struct kms_captured_plane {
 };
 
 void kms_capture_init(struct kms_capture_ctx *ctx, const char *card_path);
-int  kms_capture_wait_vblank(struct kms_capture_ctx *ctx);
 int  kms_capture_acquire(struct kms_capture_ctx *ctx,
                          struct kms_captured_plane *prim,
                          struct kms_captured_plane *cur);
 void kms_capture_release_plane(struct kms_captured_plane *pl);
+void kms_capture_cleanup(struct kms_capture_ctx *ctx);
 
 #endif /* KMSTREAM_CAPTURE_KMS_H */
